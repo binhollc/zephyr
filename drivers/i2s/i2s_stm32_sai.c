@@ -288,7 +288,7 @@ static int i2s_stm32_sai_dma_init(const struct device *dev)
 	hdma->Init.Request = dma_cfg.dma_slot;
 #endif
 
-#if defined(CONFIG_DMA_STM32U5)
+#if defined(CONFIG_DMA_STM32U5) || defined(CONFIG_SOC_SERIES_STM32N6X)
 	hdma->Init.BlkHWRequest = DMA_BREQ_SINGLE_BURST;
 	hdma->Init.SrcDataWidth = DMA_SRC_DATAWIDTH_HALFWORD;
 	hdma->Init.DestDataWidth = DMA_DEST_DATAWIDTH_HALFWORD;
