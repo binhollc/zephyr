@@ -10,6 +10,7 @@
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/audio/codec.h>
 #include <zephyr/devicetree/clocks.h>
+#include <zephyr/sys/util.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(wolfson_wm8904);
@@ -18,11 +19,13 @@ LOG_MODULE_REGISTER(wolfson_wm8904);
 
 #define DT_DRV_COMPAT wolfson_wm8904
 
+#define WM8904_MCLK_CTLR(n) DT_INST_CLOCKS_CTLR_BY_NAME(n, mclk)
 struct wm8904_driver_config {
 	struct i2c_dt_spec i2c;
 	int clock_source;
 	const struct device *mclk_dev;
 	clock_control_subsys_t mclk_name;
+	bool mclk_ctrl_ok;
 };
 
 #define DEV_CFG(dev) ((const struct wm8904_driver_config *const)dev->config)
@@ -488,18 +491,30 @@ static int wm8904_configure(const struct device *dev, struct audio_codec_cfg *cf
 	wm8904_update_reg(dev, WM8904_REG_CLK_RATES_2, (uint16_t)(1UL << 14U),
 			  (uint16_t)(dev_cfg->clock_source));
 
-	if (dev_cfg->clock_source == 0) {
-		int err = clock_control_on(dev_cfg->mclk_dev, dev_cfg->mclk_name);
+	if (dev_cfg->mclk_dev && device_is_ready(dev_cfg->mclk_dev) && dev_cfg->mclk_ctrl_ok) {
+		uint32_t rate = 0U;
+		int err;
 
+		err = clock_control_on(dev_cfg->mclk_dev, dev_cfg->mclk_name);
 		if (err < 0) {
-			LOG_ERR("MCLK clock source enable fail: %d", err);
+			LOG_WRN("MCLK enable failed (%d); using cfg->mclk_freq=%u", err,
+				cfg->mclk_freq);
 		}
 
-		err = clock_control_get_rate(dev_cfg->mclk_dev, dev_cfg->mclk_name,
-					     &cfg->mclk_freq);
-		if (err < 0) {
-			LOG_ERR("MCLK clock source freq acquire fail: %d", err);
+		err = clock_control_get_rate(dev_cfg->mclk_dev, dev_cfg->mclk_name, &rate);
+		if (err == 0 && rate > 0U) {
+			cfg->mclk_freq = rate;
+		} else {
+			LOG_WRN("MCLK get_rate failed (%d); using cfg->mclk_freq=%u", err,
+				cfg->mclk_freq);
 		}
+	} else {
+		LOG_DBG("No usable clock-control MCLK; using cfg->mclk_freq=%u", cfg->mclk_freq);
+	}
+
+	if (cfg->mclk_freq == 0U) {
+		LOG_ERR("mclk_freq is 0; provide cfg->mclk_freq or a valid MCLK clock");
+		return -EINVAL;
 	}
 
 	wm8904_audio_fmt_config(dev, &cfg->dai_cfg, cfg->mclk_freq);
@@ -671,11 +686,19 @@ static const struct audio_codec_api wm8904_driver_api = {
 #define WM8904_INIT(n)                                                                             \
 	static const struct wm8904_driver_config wm8904_device_config_##n = {                      \
 		.i2c = I2C_DT_SPEC_INST_GET(n),                                                    \
-		.clock_source = DT_INST_ENUM_IDX(n, clock_source),				   \
-		.mclk_dev = DEVICE_DT_GET(DT_INST_CLOCKS_CTLR_BY_NAME(n, mclk)),                   \
-		.mclk_name = (clock_control_subsys_t)DT_INST_CLOCKS_CELL_BY_NAME(n, mclk, name)};  \
+		.clock_source = DT_INST_ENUM_IDX(n, clock_source),                                 \
+		.mclk_dev = COND_CODE_1(DT_INST_NODE_HAS_PROP(n, clocks),                          \
+					(DEVICE_DT_GET(WM8904_MCLK_CTLR(n))),                         \
+					(NULL)),                              \
+  		.mclk_name = COND_CODE_1(DT_INST_CLOCKS_HAS_CELL_BY_NAME(n, mclk, name),           \
+					 ((clock_control_subsys_t)DT_INST_CLOCKS_CELL_BY_NAME(n, mclk, name)), \
+					 ((clock_control_subsys_t)0)),                                    \
+		.mclk_ctrl_ok = COND_CODE_1(DT_INST_CLOCKS_HAS_CELL_BY_NAME(n, mclk, name),        \
+					    (true),                                                 \
+					    (COND_CODE_1(DT_NODE_HAS_COMPAT(WM8904_MCLK_CTLR(n), fixed_clock), \
+							 (true), (false)))) };                      \
                                                                                                    \
-	DEVICE_DT_INST_DEFINE(n, NULL, NULL, NULL, &wm8904_device_config_##n,        \
-			      POST_KERNEL, CONFIG_AUDIO_CODEC_INIT_PRIORITY, &wm8904_driver_api);
+	DEVICE_DT_INST_DEFINE(n, NULL, NULL, NULL, &wm8904_device_config_##n, POST_KERNEL,         \
+			      CONFIG_AUDIO_CODEC_INIT_PRIORITY, &wm8904_driver_api);
 
 DT_INST_FOREACH_STATUS_OKAY(WM8904_INIT)
