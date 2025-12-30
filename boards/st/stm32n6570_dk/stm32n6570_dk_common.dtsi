@@ -257,6 +257,12 @@
 	status = "okay";
 };
 
+&rtc{
+  clocks = <&rcc STM32_CLOCK(APB4, 16)>,
+			     <&rcc STM32_SRC_LSE RTC_SEL(1)>;
+  status = "okay";
+};
+
 csi_i2c: &i2c1 {
 	clocks = <&rcc STM32_CLOCK(APB1, 21)>,
 		 <&rcc STM32_SRC_CKPER I2C1_SEL(1)>;

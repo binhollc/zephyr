@@ -18,9 +18,9 @@ static int set_date_time(const struct device *rtc)
 		.tm_year = 2024 - 1900,
 		.tm_mon = 11 - 1,
 		.tm_mday = 17,
-		.tm_hour = 4,
-		.tm_min = 19,
-		.tm_sec = 0,
+		.tm_hour = 3,
+		.tm_min = 50,
+		.tm_sec = 20,
 	};
 
 	ret = rtc_set_time(rtc, &tm);
