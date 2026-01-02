@@ -29,7 +29,7 @@ void stm32_backup_domain_enable_access(void)
 {
 	k_spinlock_key_t key = k_spin_lock(&lock);
 
-	if (refcount == 0U) {
+	if (refcount == 0U ) {
 		ENABLE_BKUP_ACCESS();
 		while (!IS_ENABLED_BKUP_ACCESS()) {
 		}

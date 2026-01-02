@@ -442,54 +442,18 @@ static int rtc_stm32_init(const struct device *dev)
 	__maybe_unused struct rtc_stm32_data *data = dev->data;
 
 	int err = 0;
-
-  /* Personal */
-  /* Configure the System Power Supply */
-  LL_AHB4_GRP1_EnableClock(LL_AHB4_GRP1_PERIPH_PWR);
-  LL_PWR_ConfigSupply(LL_PWR_EXTERNAL_SOURCE_SUPPLY);
-  while (LL_PWR_IsActiveFlag_ACTVOSRDY() == 0U)
-  {
-  }
-
-  /** Configure the main internal regulator output voltage
-  */
-  LL_PWR_SetRegulVoltageScaling(LL_PWR_REGU_VOLTAGE_SCALE1);
-  while(LL_PWR_IsActiveFlag_VOSRDY() == 0)
-  {
-  }
-
-  LL_RCC_HSI_Enable();
-
-   /* Wait till HSI is ready */
-  while(LL_RCC_HSI_IsReady() == 0)
-  {
-  }
-  LL_PWR_EnableBkUpAccess();
-  LL_RCC_LSE_SetDriveCapability(LL_RCC_LSEDRIVE_MEDIUMHIGH);
-  LL_RCC_LSE_Enable();
-
-   /* Wait till LSE is ready */
-  while(LL_RCC_LSE_IsReady() != 1)
-  {
-
-  }
-  LL_RCC_SetAPB4Prescaler(LL_RCC_APB4_DIV_1);
-  /* Personal */
  
-  
-  printf("rtc_init 1\n");
+	stm32_backup_domain_enable_access();
 	if (!device_is_ready(clk)) {
 		LOG_ERR("clock control device not ready");
 		return -ENODEV;
 	}
-
-  printf("rtc_init 2\n");
+  err =0;
 	/* Enable RTC bus clock */
 	if (clock_control_on(clk, (clock_control_subsys_t)&cfg->pclken[0]) != 0) {
 		LOG_ERR("clock op failed\n");
 		return -EIO;
 	}
-
 
 #if defined(CONFIG_SOC_SERIES_STM32WB0X)
 	/**
@@ -521,15 +485,11 @@ static int rtc_stm32_init(const struct device *dev)
 	}
 #endif /* CONFIG_SOC_SERIES_STM32WB0X */
 
-  printf("rtc_init 3\n");
-	stm32_backup_domain_enable_access();
-
 #if DT_INST_CLOCKS_CELL_BY_IDX(0, 1, bus) == STM32_SRC_HSE
 	/* Must be configured before selecting the RTC clock source */
 	LL_RCC_SetRTC_HSEPrescaler(cfg->hse_prescaler);
 #endif
 
-  printf("rtc_init 4\n");
 	/* Enable RTC clock source */
 	if (cfg->pclken[1].enr != NO_SEL) {
 		err = clock_control_configure(clk, (clock_control_subsys_t)&cfg->pclken[1], NULL);
@@ -559,7 +519,6 @@ static int rtc_stm32_init(const struct device *dev)
 	z_stm32_hsem_unlock(CFG_HW_RCC_SEMID);
 #endif /* CONFIG_SOC_SERIES_STM32WBAX */
 
-  printf("rtc_init 5\n");
 	err = rtc_stm32_configure(dev);
 
 	stm32_backup_domain_disable_access();
@@ -574,50 +533,8 @@ static int rtc_stm32_init(const struct device *dev)
 		memset(&(data->rtc_alrm_b), 0, sizeof(struct rtc_stm32_alrm));
 	}
 #endif /* CONFIG_RTC_ALARM */
-  LL_RTC_SetAsynchPrescaler(RTC, 127);
-  LL_RTC_SetSynchPrescaler(RTC, 255);
-
-
-  printk("RTC init");
-  LOG_DBG("\n\t\t\tRTC_init: ASYNC pre %d\n", LL_RTC_GetAsynchPrescaler(RTC));
-  LOG_DBG("\n\t\t\tRTC_init: SYNC  pre %d\n", LL_RTC_GetSynchPrescaler(RTC));
-  /* Check LSE ready status */
-  LOG_DBG("\nLSE Ready = %d\n", LL_RCC_LSE_IsReady());
-
-  /* Check LSE drive capability */
-#ifdef LL_RCC_LSE_GetDriveCapability
-  LOG_DBG("\nLSE Drive = %d\n", LL_RCC_LSE_GetDriveCapability());
-#endif
-  /* Ensure LSE is enabled and selected */
-  if (!LL_RCC_LSE_IsReady()) {
-    LOG_ERR("LSE not ready! Enabling...");
-    LL_PWR_EnableBkUpAccess();
-    LL_RCC_LSE_Enable();
-
-    int timeout = 5000;
-    while (!LL_RCC_LSE_IsReady() && timeout--) {
-        LOG_ERR("LSE failed to start!");
-        k_msleep(1);
-    }
-
-    if (!LL_RCC_LSE_IsReady()) {
-        LOG_ERR("LSE failed to start!");
-    }
-  }
-  // / * Force RTC clock source to LSE  * /
-  if (LL_RCC_GetRTCClockSource() != LL_RCC_RTC_CLKSOURCE_LSE) {
-    LOG_WRN("RTC not using LSE! Switching...");
-    LL_RCC_SetRTCClockSource(LL_RCC_RTC_CLKSOURCE_LSE);
-  }
-
-  LOG_DBG("\n\t\t[LSE Running] \n");
-  LL_RTC_SetAsynchPrescaler(RTC, 127);
-  LL_RTC_SetSynchPrescaler(RTC, 255);
-  LL_RCC_SetRTCClockSource(LL_RCC_RTC_CLKSOURCE_LSE);
-  // * Enable RTC clock / * /
-  LL_RCC_EnableRTC();
-
-	return err;
+	
+  return err;
 }
 
 static int rtc_stm32_set_time(const struct device *dev, const struct rtc_time *timeptr)
@@ -651,15 +568,6 @@ static int rtc_stm32_set_time(const struct device *dev, const struct rtc_time *t
 	 */
 
 	LOG_DBG("Setting clock");
-  __HAL_RCC_LSE_CONFIG(RCC_LSE_BYPASS_DIGITAL);
-
-/*
-  LL_PWR_EnableBkUpAccess();
-  LL_RCC_ForceBackupDomainReset();
-  LL_RCC_ReleaseBackupDomainReset();
-*/  
-  LL_APB4_GRP1_EnableClock(LL_APB4_GRP1_PERIPH_RTCAPB);
-  LL_APB4_GRP1_EnableClock(LL_APB4_GRP1_PERIPH_RTC);
 
 	k_spinlock_key_t key = k_spin_lock(&data->lock);
 
@@ -671,71 +579,6 @@ static int rtc_stm32_set_time(const struct device *dev, const struct rtc_time *t
 	/* Set Initialization mode */
 	err = rtc_stm32_enter_init_mode();
 
-///*
-  //LL_RTC_InitTypeDef RTC_InitStruct = {0};
-
-  if(LL_RCC_GetRTCClockSource() != LL_RCC_RTC_CLKSOURCE_LSE)
-  {
-    if (LL_PWR_IsEnabledBkUpAccess () != 1U)
-    {
-      /* Enable write access to Backup domain */
-      LL_PWR_EnableBkUpAccess();
-      while (LL_PWR_IsEnabledBkUpAccess () == 0U)
-      {
-      }
-    }
-    LL_RCC_ForceBackupDomainReset();
-    LL_RCC_ReleaseBackupDomainReset();
-  LL_RCC_LSE_SetDriveCapability(LL_RCC_LSEDRIVE_MEDIUMHIGH);
-    LL_RCC_LSE_Enable();
-
-   /* Wait till LSE is ready */
-    while(LL_RCC_LSE_IsReady() != 1)
-    {
-    }
-  LL_RCC_SetRTCClockSource(LL_RCC_RTC_CLKSOURCE_LSE);
-  }
-
-  /* Peripheral clock enable */
-  LL_APB4_GRP1_EnableClock(LL_APB4_GRP1_PERIPH_RTCAPB);
-  LL_APB4_GRP1_EnableClock(LL_APB4_GRP1_PERIPH_RTC);
-
-  ///* USER CODE BEGIN RTC_Init 1 */
-  LL_RTC_TimeTypeDef RTC_TimeStruct = {0};
-  LL_RTC_DateTypeDef RTC_DateStruct = {0};
-  ///* USER CODE END RTC_Init 1 */
-  //RTC_InitStruct.HourFormat = LL_RTC_HOURFORMAT_24HOUR;
-  //rtc_initStruct.AsynchPrescaler = 127;
-  //RTC_InitStruct.SynchPrescaler = 255;
-  //LL_RTC_Init(RTC, &RTC_InitStruct);
-  LL_RTC_SetRtcSecure(RTC, LL_RTC_SECURE_FULL_YES);
-  LL_RTC_SetBackupRegisterPrivilege(RTC, LL_RTC_PRIVILEGE_BKUP_ZONE_NONE);
-  LL_RTC_SetBackupRegProtection(RTC, LL_RTC_BKP_DR0, LL_RTC_BKP_DR0);
-  LL_RTC_SetRtcPrivilege(RTC, LL_RTC_PRIVILEGE_FULL_NO);
-//*/
-  
-  /** Initialize RTC and set the Time and Date
-  */
-  if(LL_RTC_BKP_GetRegister(RTC,LL_RTC_BKP_DR0) != 0x32F2){
-  
-    LL_RTC_BKP_SetRegister(RTC,LL_RTC_BKP_DR0,0x32F2);
-  }
-  
-  LL_RTC_SetAsynchPrescaler(RTC, 127);
-  LL_RTC_SetSynchPrescaler(RTC, 255);
-/*  
-  RTC_TimeStruct.Hours = 0x9;
-  RTC_TimeStruct.Minutes = 0x36;
-  RTC_TimeStruct.Seconds = 0x50;
-
-  LL_RTC_TIME_Init(RTC, LL_RTC_FORMAT_BCD, &RTC_TimeStruct);
-  RTC_DateStruct.WeekDay = LL_RTC_WEEKDAY_FRIDAY;
-  RTC_DateStruct.Month = LL_RTC_MONTH_DECEMBER;
-  RTC_DateStruct.Day = 0x6;
-  RTC_DateStruct.Year = 0x24;
-
-  LL_RTC_DATE_Init(RTC, LL_RTC_FORMAT_BCD, &RTC_DateStruct);
-*/
 	if (err == 0) {
 		/* Set time and date */
 		LL_RTC_TIME_Config(RTC, LL_RTC_TIME_FORMAT_AM_OR_24, hours, minutes, seconds);
@@ -761,8 +604,8 @@ static int rtc_stm32_set_time(const struct device *dev, const struct rtc_time *t
 		;
 	}
 #endif /* CONFIG_SOC_SERIES_STM32F2X */
-
-	LOG_DBG("Calendar set : %d/%d/%d - %dh%dm%ds",
+  
+  LOG_DBG("Calendar set : %d/%d/%d - %dh%dm%ds",
 			LL_RTC_DATE_GetDay(RTC),
 			LL_RTC_DATE_GetMonth(RTC),
 			LL_RTC_DATE_GetYear(RTC),
@@ -770,17 +613,6 @@ static int rtc_stm32_set_time(const struct device *dev, const struct rtc_time *t
 			LL_RTC_TIME_GetMinute(RTC),
 			LL_RTC_TIME_GetSecond(RTC)
 	);
-  
-  LOG_DBG("RTC   BIN  = %d", LL_RTC_GetBinaryMode(RTC));
-  LOG_DBG("Async PRER = %d", LL_RTC_GetAsynchPrescaler(RTC));
-  LOG_DBG("Sync  PRER = %d", LL_RTC_GetSynchPrescaler(RTC));
-  LOG_DBG("APB4  CLK  = %d", HAL_RCC_GetPCLK4Freq() );
-  LOG_DBG("Is RTC CLK en = %d", __HAL_RCC_RTC_IS_CLK_ENABLED());
-  LOG_DBG("Is RTC APB CLK en = %d", __HAL_RCC_RTCAPB_IS_CLK_ENABLED());
-  /* If  RTC_CR_BYPSHAD bit = 0, wait for synchro else this check is not needed */
-  if (LL_RTC_IsShadowRegBypassEnabled(RTC) == 0U) 
-    LOG_DBG("RTC_CR_BYPSHAD");
-
   
 	k_spin_unlock(&data->lock, key);
 
@@ -865,31 +697,6 @@ static int rtc_stm32_get_time(const struct device *dev, struct rtc_time *timeptr
 	/* unknown values */
 	timeptr->tm_yday  = -1;
 	timeptr->tm_isdst = -1;
-
-  LOG_DBG("\tGDB %.2d:%.2d:%.2d", __LL_RTC_CONVERT_BCD2BIN(LL_RTC_TIME_GetHour(RTC)),
-                                  __LL_RTC_CONVERT_BCD2BIN(LL_RTC_TIME_GetMinute(RTC)),
-                                  __LL_RTC_CONVERT_BCD2BIN(LL_RTC_TIME_GetSecond(RTC)));
-  
-  LOG_DBG("RTC   BIN  = %d", LL_RTC_GetBinaryMode(RTC));
-  LOG_DBG("Async PRER = %d", LL_RTC_GetAsynchPrescaler(RTC));
-  LOG_DBG("Sync  PRER = %d", LL_RTC_GetSynchPrescaler(RTC));
-  LOG_DBG("APB4  CLK  = %d", HAL_RCC_GetPCLK4Freq() );
-  LOG_DBG("Is RTC CLK en = %d", __HAL_RCC_RTC_IS_CLK_ENABLED());
-  LOG_DBG("Is RTC APB CLK en = %d", __HAL_RCC_RTCAPB_IS_CLK_ENABLED());
-  LOG_DBG("RTC CLK LSE? = %d", LL_RCC_GetRTCClockSource());
-  LOG_DBG("RTC LSE value = %d", LL_RCC_RTC_CLKSOURCE_LSE);
-  /* If  RTC_CR_BYPSHAD bit = 0, wait for synchro else this check is not needed */
-  if (LL_RTC_IsShadowRegBypassEnabled(RTC) == 0U) 
-    LOG_DBG("RTC_CR_BYPSHAD");
-
-	/* __LL_RTC_GET_YEAR(rtc_date)is the real year (from 2000) */
-	LOG_DBG("Calendar get : %d/%d/%d - %dh%dm%ds",
-		timeptr->tm_mday,
-		timeptr->tm_mon,
-		__LL_RTC_GET_YEAR(rtc_date),
-		timeptr->tm_hour,
-		timeptr->tm_min,
-		timeptr->tm_sec);
 
 	return 0;
 }

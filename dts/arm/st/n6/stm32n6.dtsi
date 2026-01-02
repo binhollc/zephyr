@@ -603,7 +603,7 @@
 			         <&rcc STM32_CLOCK(APB4, 17)>,
 			         <&rcc STM32_SRC_LSE RTC_SEL(1)>;
       sync-prescaler = <255>;
-      async-prescaler = <8>;
+      async-prescaler = <127>;
       alarms-count = <2>;
       alrm-exti-line = <17>;
 			interrupts = <10 15>;
