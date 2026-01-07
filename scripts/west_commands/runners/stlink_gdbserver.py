@@ -11,6 +11,11 @@ import argparse
 import platform
 import re
 import shutil
+
+import os
+import tempfile
+
+
 from pathlib import Path
 
 from runners.core import MissingProgram, RunnerCaps, RunnerConfig, ZephyrBinaryRunner
@@ -118,6 +123,11 @@ class STLinkGDBServerRunner(ZephyrBinaryRunner):
             help="Run Init() from external loader after reset",
         )
 
+        parser.add_argument('--two-boot-stage', action='store_true',
+                          help='Debug application running from flash with special boot-chain (MCUboot mode first)')
+        parser.add_argument('--mcuboot-offset', type=str,
+                          help='MCUboot image offset (e.g., 0x08040000)')
+
     @classmethod
     def do_create(cls, cfg: RunnerConfig, args: argparse.Namespace) -> "STLinkGDBServerRunner":
         return STLinkGDBServerRunner(
@@ -128,6 +138,8 @@ class STLinkGDBServerRunner(ZephyrBinaryRunner):
             args.port_number,
             args.extload,
             args.external_init,
+            args.two_boot_stage,
+            args.mcuboot_offset,
         )
 
     def __init__(
@@ -139,6 +151,8 @@ class STLinkGDBServerRunner(ZephyrBinaryRunner):
         gdb_port: int,
         external_loader: str | None,
         external_init: bool,
+        two_boot_stage: bool,
+        mcuboot_offset: str|None,
     ):
         super().__init__(cfg)
         self.ensure_output('elf')
@@ -149,12 +163,79 @@ class STLinkGDBServerRunner(ZephyrBinaryRunner):
         self._ap_id = ap_id
         self._external_loader = external_loader
         self._do_external_init = external_init
+        self._two_boot_stage = two_boot_stage
+        self._mcuboot_offset = mcuboot_offset or '0x08040000'
 
     def do_run(self, command: str, **kwargs):
         if command in ["attach", "debug", "debugserver"]:
             self.do_attach_debug_debugserver(command)
         else:
             raise ValueError(f"{command} not supported")
+    
+    def _find_mcuboot_elf(self) -> str:
+        """Find MCUboot ELF file in sysbuild output."""
+
+        # Sysbuild puts MCUboot at: build/mcuboot/zephyr/zephyr.elf
+        mcuboot_elf = Path(self.cfg.build_dir) / 'mcuboot' / 'zephyr' / 'zephyr.elf'
+
+        if mcuboot_elf.exists():
+            return mcuboot_elf.as_posix()
+
+        # Alternative location for older Zephyr
+        mcuboot_elf_alt = Path(self.cfg.build_dir).parent / 'mcuboot' / 'zephyr' / 'zephyr.elf'
+        if mcuboot_elf_alt.exists():
+            return mcuboot_elf_alt.as_posix()
+
+        raise RuntimeError(
+            "MCUboot ELF not found. For --flash mode with sysbuild, "
+            "MCUboot must be built (use --sysbuild flag)"
+        )
+
+    def _create_mcuboot_debug_script(self, app_elf_path: str) -> str:
+        """Create temporary GDB script for MCUboot two-phase debugging."""
+        import tempfile
+    
+        # Create temporary script
+        script_content = f"""
+            # ============================================================
+            # PHASE 1: RUN MCUBOOT AND INITIALIZE EXTERNAL FLASH
+            # ============================================================
+            target remote :{self._gdb_port}
+            #monitor reset halt
+            
+            # Load MCUboot into device
+            load
+            
+            # Break at boot_go (before jumping to app)
+            hbreak boot_go
+            continue
+            
+            # Step through external flash initialization
+            next
+            next
+            
+            # ============================================================
+            # PHASE 2: EXTERNAL FLASH READY - LOAD APP SYMBOLS
+            # ============================================================
+            
+            # Add application symbols at correct offset
+            add-symbol-file {app_elf_path} {self._mcuboot_offset}
+            
+            # Set breakpoint in app
+            break main
+            
+            # Continue into application
+            continue
+            """
+    
+        # Write to temporary file
+        fd, script_path = tempfile.mkstemp(suffix='.gdb', text=True)
+        with os.fdopen(fd, 'w') as f:
+            f.write(script_content)
+        
+        return script_path
+
+
 
     def do_attach_debug_debugserver(self, command: str):
         # self.ensure_output('elf') is called in constructor
@@ -179,6 +260,20 @@ class STLinkGDBServerRunner(ZephyrBinaryRunner):
 
         if command == "attach":
             gdbserver_cmd += ["--attach"]
+        
+        elif self._two_boot_stage and command == "debug":
+            # Flash mode: Debug MCUboot app already in flash
+            gdbserver_cmd += ["--attach"]  # Don't reset!
+            
+            # Create GDB script for two-phase debug
+            gdb_script = self._create_mcuboot_debug_script(elf_path)
+
+            # Find MCUboot ELF
+            mcuboot_elf = self._find_mcuboot_elf()
+
+            # Start GDB with MCUboot symbols, script handles the rest
+            gdb_args = ["-x", gdb_script, mcuboot_elf]
+            
         else:  # debug/debugserver
             gdbserver_cmd += ["--initialize-reset"]
             gdb_args += ["-ex", f"load {elf_path}"]
