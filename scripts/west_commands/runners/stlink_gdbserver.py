@@ -12,10 +12,6 @@ import platform
 import re
 import shutil
 
-import os
-import tempfile
-
-
 from pathlib import Path
 
 from runners.core import MissingProgram, RunnerCaps, RunnerConfig, ZephyrBinaryRunner
@@ -266,13 +262,24 @@ class STLinkGDBServerRunner(ZephyrBinaryRunner):
             gdbserver_cmd += ["--attach"]  # Don't reset!
             
             # Create GDB script for two-phase debug
-            gdb_script = self._create_mcuboot_debug_script(elf_path)
-
+            #gdb_script = self._create_mcuboot_debug_script(elf_path)
+            
             # Find MCUboot ELF
             mcuboot_elf = self._find_mcuboot_elf()
-
+                
             # Start GDB with MCUboot symbols, script handles the rest
-            gdb_args = ["-x", gdb_script, mcuboot_elf]
+            gdb_args =[
+                "-ex", f"target remote :{self._gdb_port}",
+                "-ex", "load",
+                "-ex", "hbreak boot_go",
+                "-ex", "continue",
+                "-ex", "set confirm off",
+                "-ex", f"add-symbol-file {elf_path}",
+                "-ex", "set confirm on",
+                "-ex", "break main",
+                "-ex", "continue",
+                mcuboot_elf,
+            ]
             
         else:  # debug/debugserver
             gdbserver_cmd += ["--initialize-reset"]
