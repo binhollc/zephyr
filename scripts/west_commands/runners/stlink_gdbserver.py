@@ -168,6 +168,67 @@ class STLinkGDBServerRunner(ZephyrBinaryRunner):
         else:
             raise ValueError(f"{command} not supported")
     
+    def _get_start_address(self) -> int:
+        """Get the start address from ELF file entry point."""
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ['arm-none-eabi-readelf', '-h', self.cfg.elf_file],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+
+            # Parse "Entry point address: 0x34180749"
+            for line in result.stdout.split('\n'):
+                if 'Entry point address' in line:
+                    addr_str = line.split(':')[1].strip()
+                    return int(addr_str, 16)
+
+        except Exception as e:
+            self.logger.warning(f"Could not read entry point: {e}")
+
+        return 0
+
+    def _is_fsbl_mode(self, start_address: int) -> bool:
+        """Check if application is in FSBL memory region (0x34180000-0x3418FFFF)."""
+        return (start_address & 0xFFFF0000) == 0x34180000
+    def _is_ram_mode(self, start_address: int) -> bool:
+        """Check if application is in RAM region (not FSBL)."""
+        # RAM region: 0x34000000 - 0x3417FFFF
+        return 0x34000000 <= start_address < 0x34180000
+
+
+    def _get_stm32_soc(self) -> str:
+        """
+        Get STM32 SoC family from build config.
+
+        Returns:
+            'STM32N6', 'STM32H7', 'STM32F4', etc. or 'unknown'
+        """
+        from pathlib import Path
+
+        config_file = Path(self.cfg.build_dir) / 'zephyr' / '.config'
+
+        if not config_file.exists():
+            return 'unknown'
+
+        try:
+            with open(config_file, 'r') as f:
+                for line in f:
+                    # Look for CONFIG_SOC_SERIES_STM32XXX=y
+                    if line.startswith('CONFIG_SOC_SERIES_STM32') and '=y' in line:
+                        # Extract: CONFIG_SOC_SERIES_STM32N6X=y → STM32N6X
+                        soc_series = line.split('=')[0].replace('CONFIG_SOC_SERIES_', '').strip()
+                        # Return just the family: STM32N6X → STM32N6
+                        return soc_series[:7]  # 'STM32N6' from 'STM32N6X'
+
+        except Exception as e:
+            pass
+
+        return 'unknown'
+
     def _find_mcuboot_elf(self) -> str:
         """Find MCUboot ELF file in sysbuild output."""
 
@@ -241,6 +302,14 @@ class STLinkGDBServerRunner(ZephyrBinaryRunner):
         # trigger in real-world scenarios.
         assert self.cfg.elf_file is not None
         elf_path = Path(self.cfg.elf_file).as_posix()
+            
+        # Detect SoC and execution mode
+        soc = self._get_stm32_soc()
+        start_address = self._get_start_address()
+        is_fsbl = self._is_fsbl_mode(start_address)
+        is_ram = self._is_ram_mode(start_address)
+        
+        self.logger.info(f"SoC: {soc}, Entry: 0x{start_address:08x}, FSBL: {is_fsbl}")
 
         gdb_args = ["-ex", f"target remote :{self._gdb_port}", elf_path]
 
@@ -257,7 +326,9 @@ class STLinkGDBServerRunner(ZephyrBinaryRunner):
         if command == "attach":
             gdbserver_cmd += ["--attach"]
         
-        elif self._two_boot_stage and command == "debug":
+        # STM32N6 two boot layer stage commands
+        elif not is_fsbl and not is_ram and (soc=='STM32N6'):
+        #elif self._two_boot_stage and command == "debug":
             # Flash mode: Debug MCUboot app already in flash
             gdbserver_cmd += ["--attach"]  # Don't reset!
             
@@ -280,8 +351,8 @@ class STLinkGDBServerRunner(ZephyrBinaryRunner):
                 "-ex", "continue",
                 mcuboot_elf,
             ]
-            
-        else:  # debug/debugserver
+        
+        else:  
             gdbserver_cmd += ["--initialize-reset"]
             gdb_args += ["-ex", f"load {elf_path}"]
 
