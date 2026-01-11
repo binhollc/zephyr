@@ -170,26 +170,42 @@ class STLinkGDBServerRunner(ZephyrBinaryRunner):
     
     def _get_start_address(self) -> int:
         """Get the start address from ELF file entry point."""
-        import subprocess
-
+        # Check if elftools is available
         try:
-            result = subprocess.run(
-                ['arm-none-eabi-readelf', '-h', self.cfg.elf_file],
-                capture_output=True,
-                text=True,
-                check=True
-            )
+            from elftools.elf.elffile import ELFFile
+        except ImportError:
+            raise RuntimeError(
+                'elftools missing; please "pip3 install pyelftools"')
+        
+        # Parse ELF file
+        with open(self.cfg.elf_file, 'rb') as f:
+            elf = ELFFile(f)
+            entry_point = elf.header['e_entry']
+        
+        return entry_point
 
-            # Parse "Entry point address: 0x34180749"
-            for line in result.stdout.split('\n'):
-                if 'Entry point address' in line:
-                    addr_str = line.split(':')[1].strip()
-                    return int(addr_str, 16)
 
-        except Exception as e:
-            self.logger.warning(f"Could not read entry point: {e}")
 
-        return 0
+        #import subprocess
+
+        #try:
+        #    result = subprocess.run(
+        #        ['arm-none-eabi-readelf', '-h', self.cfg.elf_file],
+        #        capture_output=True,
+        #        text=True,
+        #        check=True
+        #    )
+
+        #    # Parse "Entry point address: 0x34180749"
+        #    for line in result.stdout.split('\n'):
+        #        if 'Entry point address' in line:
+        #            addr_str = line.split(':')[1].strip()
+        #            return int(addr_str, 16)
+
+        #except Exception as e:
+        #    self.logger.warning(f"Could not read entry point: {e}")
+
+        #return 0
 
     def _is_fsbl_mode(self, start_address: int) -> bool:
         """Check if application is in FSBL memory region (0x34180000-0x3418FFFF)."""
@@ -327,13 +343,9 @@ class STLinkGDBServerRunner(ZephyrBinaryRunner):
             gdbserver_cmd += ["--attach"]
         
         # STM32N6 two boot layer stage commands
-        elif not is_fsbl and not is_ram and (soc=='STM32N6'):
-        #elif self._two_boot_stage and command == "debug":
+        elif (soc=='STM32N6') and not is_fsbl and not is_ram:
             # Flash mode: Debug MCUboot app already in flash
             gdbserver_cmd += ["--attach"]  # Don't reset!
-            
-            # Create GDB script for two-phase debug
-            #gdb_script = self._create_mcuboot_debug_script(elf_path)
             
             # Find MCUboot ELF
             mcuboot_elf = self._find_mcuboot_elf()
