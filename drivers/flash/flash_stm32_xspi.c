@@ -1642,10 +1642,15 @@ static int setup_pages_layout(const struct device *dev)
 		}
 	}
 
-	uint32_t erase_size = BIT(value);
+	uint32_t erase_size;
 
-	if (erase_size == 0) {
+	if (value == 0) {
+		/* No valid erase type found from SFDP, use default sector size */
+		LOG_WRN("No valid erase type from SFDP, using default %u",
+			SPI_NOR_SECTOR_SIZE);
 		erase_size = SPI_NOR_SECTOR_SIZE;
+	} else {
+		erase_size = BIT(value);
 	}
 
 	/* We need layout page size to be compatible with erase size */
@@ -2094,15 +2099,32 @@ static int flash_stm32_xspi_init(const struct device *dev)
 	/* If MemoryMapped then configure skip init
 	 * Check clock status first as reading CR register without bus clock doesn't work on N6
 	 * If clock is off, then MemoryMapped is off too and we do init
+	 *
+	 * However, if CONFIG_XIP is disabled (app running from RAM, e.g. RAM load mode),
+	 * we need to exit memory-mapped mode and continue with full initialization
+	 * to support storage operations.
 	 */
 	if (clock_control_get_status(DEVICE_DT_GET(STM32_CLOCK_CONTROL_NODE),
 				     (clock_control_subsys_t) &dev_cfg->pclken)
 				     == CLOCK_CONTROL_STATUS_ON) {
 		if (stm32_xspi_is_memorymap(dev)) {
+#ifdef CONFIG_XIP
 			LOG_DBG("NOR init'd in MemMapped mode");
 			/* Force HAL instance in correct state */
 			dev_data->hxspi.State = HAL_XSPI_STATE_BUSY_MEM_MAPPED;
 			return 0;
+#else
+			LOG_DBG("MemMapped mode detected but XIP disabled, "
+				"exiting MemMapped for storage ops");
+			/* Set HAL state so abort works correctly */
+			dev_data->hxspi.State = HAL_XSPI_STATE_BUSY_MEM_MAPPED;
+			/* Exit memory-mapped mode before reinitializing */
+			if (HAL_XSPI_Abort(&dev_data->hxspi) != HAL_OK) {
+				LOG_ERR("Failed to exit MemMapped mode");
+				return -EIO;
+			}
+			/* Continue with full init */
+#endif /* CONFIG_XIP */
 		}
 	}
 #endif /* CONFIG_STM32_APP_IN_EXT_FLASH && CONFIG_XIP */
