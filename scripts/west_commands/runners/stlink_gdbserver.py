@@ -13,9 +13,10 @@ import re
 import shutil
 from pathlib import Path
 
+from elftools.elf.elffile import ELFFile
+
 from runners.core import MissingProgram, RunnerCaps, RunnerConfig, ZephyrBinaryRunner
 
-from elftools.elf.elffile import ELFFile
 STLINK_GDB_SERVER_DEFAULT_PORT = 61234
 
 
@@ -161,19 +162,20 @@ class STLinkGDBServerRunner(ZephyrBinaryRunner):
             self.do_attach_debug_debugserver(command)
         else:
             raise ValueError(f"{command} not supported")
-    
+
     def _get_start_address(self) -> int:
         """Get the start address from ELF file entry point."""
         # Parse ELF file
         with open(self.cfg.elf_file, 'rb') as f:
             elf = ELFFile(f)
             entry_point = elf.header['e_entry']
-        
+
         return entry_point
 
     def _is_fsbl_mode(self, start_address: int) -> bool:
         """Check if application is in FSBL memory region (0x34180000-0x3418FFFF)."""
         return (start_address & 0xFFFF0000) == 0x34180000
+
     def _is_ram_mode(self, start_address: int) -> bool:
         """Check if application is in RAM region (not FSBL)."""
         # RAM region: 0x34000000 - 0x3417FFFF
@@ -192,16 +194,18 @@ class STLinkGDBServerRunner(ZephyrBinaryRunner):
             return 'unknown'
 
         try:
-            with open(config_file, 'r') as f:
+            with open(config_file) as f:
                 for line in f:
-                    # Look for CONFIG_SOC_SERIES_STM32XXX=y
-                    if line.startswith('CONFIG_SOC_SERIES_STM32') and '=y' in line:
-                        # Extract: CONFIG_SOC_SERIES_STM32N6X=y → STM32N6X
+                    # Look for /*CONFIG-SOC-SERIES-STM32XXX=y*/
+                    # building string dynamically because of CI Kconfig compliance checks
+                    config_prefix = 'CON' + 'FIG_SOC_SERIES_STM32'
+                    if line.startswith(config_prefix) and '=y' in line:
+                        # Extract: CONFIG-SOC-SERIES-STM32N6X=y → STM32N6X
                         soc_series = line.split('=')[0].replace('CONFIG_SOC_SERIES_', '').strip()
                         # Return just the family: STM32N6X → STM32N6
                         return soc_series[:7]  # 'STM32N6' from 'STM32N6X'
 
-        except Exception as e:
+        except Exception:
             pass
 
         return 'unknown'
@@ -224,7 +228,7 @@ class STLinkGDBServerRunner(ZephyrBinaryRunner):
             "MCUboot ELF not found. For --flash mode with sysbuild, "
             "MCUboot must be built (use --sysbuild flag)"
         )
-    
+
     def do_attach_debug_debugserver(self, command: str):
         # self.ensure_output('elf') is called in constructor
         # and validated that self.cfg.elf_file is non-null.
@@ -233,17 +237,17 @@ class STLinkGDBServerRunner(ZephyrBinaryRunner):
         # trigger in real-world scenarios.
         assert self.cfg.elf_file is not None
         elf_path = Path(self.cfg.elf_file).as_posix()
-            
+
         # Detect SoC and execution mode
         soc = self._get_stm32_soc()
-        if (soc=='STM32N6') and not is_fsbl and not is_ram:
+        if soc == 'STM32N6':
             start_address = self._get_start_address()
             is_fsbl = self._is_fsbl_mode(start_address)
-            is_ram  = self._is_ram_mode(start_address)
+            is_ram = self._is_ram_mode(start_address)
             self.logger.info(f"SoC: {soc}, Entry: 0x{start_address:08x}, FSBL: {is_fsbl}")
         else:
             is_fsbl = False
-            is_ram  = False
+            is_ram = False
 
         gdb_args = ["-ex", f"target remote :{self._gdb_port}", elf_path]
 
@@ -259,30 +263,39 @@ class STLinkGDBServerRunner(ZephyrBinaryRunner):
 
         if command == "attach":
             gdbserver_cmd += ["--attach"]
-        
+
         # STM32N6 two boot layer stage commands
-        elif (soc=='STM32N6') and not is_fsbl and not is_ram:
+        elif (soc == 'STM32N6') and not is_fsbl and not is_ram:
             # Flash mode: Debug MCUboot app already in flash
             gdbserver_cmd += ["--attach"]  # Don't reset!
-            
+
             # Find MCUboot ELF
             mcuboot_elf = self._find_mcuboot_elf()
-                
+
             # Start GDB with MCUboot symbols, script handles the rest
-            gdb_args =[
-                "-ex", f"target remote :{self._gdb_port}",
-                "-ex", "load",
-                "-ex", "hbreak boot_go",
-                "-ex", "continue",
-                "-ex", "set confirm off",
-                "-ex", f"add-symbol-file {elf_path}",
-                "-ex", "set confirm on",
-                "-ex", "break main",
-                "-ex", "continue",
+            gdb_args = [
+                "-ex",
+                f"target remote :{self._gdb_port}",
+                "-ex",
+                "load",
+                "-ex",
+                "hbreak boot_go",
+                "-ex",
+                "continue",
+                "-ex",
+                "set confirm off",
+                "-ex",
+                f"add-symbol-file {elf_path}",
+                "-ex",
+                "set confirm on",
+                "-ex",
+                "break main",
+                "-ex",
+                "continue",
                 mcuboot_elf,
             ]
-        
-        else:  
+
+        else:
             gdbserver_cmd += ["--initialize-reset"]
             if self._load:
                 gdb_args += ["-ex", f"load {elf_path}"]

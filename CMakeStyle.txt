@@ -1,0 +1,23 @@
+See https://docs.zephyrproject.org/latest/contribute/style/cmake.html for more details.
+
+ An exception occurred in CMakeStyle:
+Traceback (most recent call last):
+  File "/home/jao/curso/Binho/IronSite/STM32N6_demos/zephyr/./scripts/ci/check_compliance.py", line 2804, in _main
+    test.run()
+  File "/home/jao/curso/Binho/IronSite/STM32N6_demos/zephyr/./scripts/ci/check_compliance.py", line 2061, in run
+    for fname in get_files(filter="d"):
+                 ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jao/curso/Binho/IronSite/STM32N6_demos/zephyr/./scripts/ci/check_compliance.py", line 110, in get_files
+    out = git('diff', '--name-only', *filter_arg, COMMIT_RANGE, *paths_arg)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jao/curso/Binho/IronSite/STM32N6_demos/zephyr/./scripts/ci/check_compliance.py", line 85, in git
+    err(
+  File "/home/jao/curso/Binho/IronSite/STM32N6_demos/zephyr/./scripts/ci/check_compliance.py", line 2897, in err
+    sys.exit(f"{cmd} error: {msg}")
+SystemExit: ./scripts/ci/check_compliance.py:  error: 'git diff --name-only --diff-filter=d binhollc/main..binhollc/n6-gdb-flash' exited with status 0 and/or wrote to stderr.
+==stdout==
+CMakeStyle.txt
+scripts/west_commands/runners/stlink_gdbserver.py
+
+==stderr==
+warning: refname 'binhollc/main' is ambiguous.
