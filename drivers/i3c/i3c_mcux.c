@@ -1265,9 +1265,27 @@ static int mcux_i3c_do_daa(const struct device *dev)
 			target->dynamic_addr = dyn_addr;
 			target->bcr = rx_buf[6];
 			target->dcr = rx_buf[7];
+			target->pid = pid;
 
-			/* Mark the address as I3C device */
-			i3c_addr_slots_mark_i3c(&data->common.attached_dev.addr_slots, dyn_addr);
+			/*
+			 * For dynamically discovered devices (mem slab),
+			 * set bus reference and attach to the runtime device list.
+			 * DTS devices are already attached via i3c_bus_prepare_setdasa().
+			 */
+			if (target->bus == NULL) {
+				target->bus = dev;
+				int attach_ret = i3c_attach_i3c_device(target);
+
+				if (attach_ret != 0 && attach_ret != -EALREADY) {
+					LOG_ERR("Failed to attach PID 0x%04x%08x: %d",
+						vendor_id, part_no, attach_ret);
+				}
+				/* i3c_attach_i3c_device marks the addr slot internally */
+			} else {
+				/* DTS device already attached, just mark new dynamic address */
+				i3c_addr_slots_mark_i3c(
+					&data->common.attached_dev.addr_slots, dyn_addr);
+			}
 
 			/*
 			 * If the device has static address, after address assignment,
