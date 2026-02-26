@@ -1544,14 +1544,15 @@ static int i3c_stm32_init(const struct device *dev)
 	i3c_stm32_configure(dev, I3C_CONFIG_CONTROLLER, &data->drv_data.ctrl_config);
 	i3c_stm32_controller_init(dev);
 
-	/* Perform bus initialization only if there are devices that already exist on the bus */
-	if (config->drv_cfg.dev_list.num_i3c > 0 &&
-	    !(config->drv_cfg.flags & I3C_CONTROLLER_FLAG_DISABLE_BUS_INIT)) {
-		ret = i3c_bus_init(dev, &config->drv_cfg.dev_list);
-		if (ret != 0) {
-			LOG_ERR("Failed to do i3c bus init, err=%d", ret);
-			return ret;
-		}
+	/* Perform bus initialization.
+	 * Always run i3c_bus_init() even when there are no DTS child nodes,
+	 * so that ENTDAA can discover devices dynamically via mem slab
+	 * descriptors (CONFIG_I3C_NUM_OF_DESC_MEM_SLABS).
+	 */
+	ret = i3c_bus_init(dev, &config->drv_cfg.dev_list);
+	if (ret != 0) {
+		LOG_ERR("Failed to do i3c bus init, err=%d", ret);
+		return ret;
 	}
 
 #ifdef CONFIG_I3C_USE_IBI
@@ -1623,10 +1624,30 @@ static void i3c_stm32_event_isr_tx(const struct device *dev)
 			target->dynamic_addr = dyn_addr;
 			target->bcr = bcr;
 			target->dcr = dcr;
-		}
+			target->pid = data->pid;
 
-		/* Mark the address as used */
-		i3c_addr_slots_mark_i3c(&data->drv_data.attached_dev.addr_slots, dyn_addr);
+			/*
+			 * For dynamically discovered devices (mem slab),
+			 * set bus reference and attach to the runtime device list.
+			 * DTS devices are already attached via i3c_bus_prepare_setdasa().
+			 */
+			if (target->bus == NULL) {
+				target->bus = dev;
+				ret = i3c_attach_i3c_device(target);
+				if (ret != 0 && ret != -EALREADY) {
+					LOG_ERR("Failed to attach dynamic target 0x%02x: %d",
+						dyn_addr, ret);
+				}
+				/* i3c_attach_i3c_device marks the addr slot internally */
+			} else {
+				/* DTS device already attached, just mark new dynamic address */
+				i3c_addr_slots_mark_i3c(
+					&data->drv_data.attached_dev.addr_slots, dyn_addr);
+			}
+		} else {
+			/* No descriptor available, just mark the address as used */
+			i3c_addr_slots_mark_i3c(&data->drv_data.attached_dev.addr_slots, dyn_addr);
+		}
 
 		/* Mark the static address as free */
 		if ((target != NULL) && (target->static_addr != 0) &&

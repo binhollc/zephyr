@@ -106,8 +106,8 @@ extern "C" {
 		.pid = ((uint64_t)DT_PROP_BY_IDX(node_id, reg, 1) << 32) |                         \
 		       DT_PROP_BY_IDX(node_id, reg, 2),                                            \
 		.init_dynamic_addr = DT_PROP_OR(node_id, assigned_address, 0),                     \
-		.flags = FIELD_PREP(I3C_SUPPORTS_SETAASA, DT_PROP(node_id, supports_setaasa)) |    \
-			 FIELD_PREP(I3C_V1P0_SUPPORT, DT_PROP(node_id, v1p0_support)),             \
+		.flags = FIELD_PREP(I3C_SUPPORTS_SETAASA, DT_PROP_OR(node_id, supports_setaasa, 0)) | \
+			 FIELD_PREP(I3C_V1P0_SUPPORT, DT_PROP_OR(node_id, v1p0_support, 0)),         \
 	},
 
 /**
