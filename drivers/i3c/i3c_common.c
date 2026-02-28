@@ -18,6 +18,13 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(i3c, CONFIG_I3C_LOG_LEVEL);
 
+/* Trace macro — enable with CONFIG_IOB_TRACE=y */
+#if IS_ENABLED(CONFIG_IOB_TRACE)
+#define TRACE(...) printk(__VA_ARGS__)
+#else
+#define TRACE(...) do {} while (0)
+#endif
+
 void i3c_dump_msgs(const char *name, const struct i3c_msg *msgs, uint8_t num_msgs,
 		   struct i3c_device_desc *target)
 {
@@ -1501,24 +1508,21 @@ int i3c_bus_init(const struct device *dev, const struct i3c_dev_list *dev_list)
 	 * Perform Dynamic Address Assignment if needed.
 	 */
 	if (need_daa) {
+		TRACE("[i3c] bus_init: DAA attempt 1\n");
 		ret = i3c_do_daa(dev);
 		if (ret != 0) {
-			/*
-			 * Spec says to try once more
-			 * if DAA fails the first time.
-			 */
+			TRACE("[i3c] bus_init: DAA attempt 1 failed (%d), retrying\n", ret);
 			ret = i3c_do_daa(dev);
 			if (ret != 0) {
-				/*
-				 * Failure to finish dynamic address assignment
-				 * is not the end of world... hopefully.
-				 * Continue on so the devices already have
-				 * addresses can still function.
-				 */
+				TRACE("[i3c] bus_init: DAA attempt 2 failed (%d)\n", ret);
 				LOG_ERR("DAA was not successful.");
 			}
 		}
+		TRACE("[i3c] bus_init: DAA done, ret=%d\n", ret);
 	}
+
+	TRACE("[i3c] bus_init: device info queries start (%d devices)\n",
+	       dev_list->num_i3c);
 
 	/*
 	 * Loop through the registered I3C devices to retrieve
@@ -1545,6 +1549,7 @@ int i3c_bus_init(const struct device *dev, const struct i3c_dev_list *dev_list)
 				desc->data_length.mwl, desc->data_length.max_ibi);
 		}
 	}
+	TRACE("[i3c] bus_init: device info queries done\n");
 #ifdef CONFIG_I3C_TARGET
 	if (i3c_bus_has_sec_controller(dev)) {
 		ret = i3c_bus_deftgts(dev);
@@ -1558,6 +1563,7 @@ int i3c_bus_init(const struct device *dev, const struct i3c_dev_list *dev_list)
 	 * Target interrupts will be enabled when IBI is enabled.
 	 * Skip if disabled by controller flags.
 	 */
+	TRACE("[i3c] bus_init: ENEC HJ\n");
 	{
 		const struct i3c_driver_config *common =
 			(const struct i3c_driver_config *)dev->config;
@@ -1570,6 +1576,7 @@ int i3c_bus_init(const struct device *dev, const struct i3c_dev_list *dev_list)
 			}
 		}
 	}
+	TRACE("[i3c] bus_init: complete, ret=%d\n", ret);
 
 err_out:
 	return ret;
