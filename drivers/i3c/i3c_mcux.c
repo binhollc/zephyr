@@ -69,6 +69,13 @@ LOG_MODULE_REGISTER(i3c_mcux, CONFIG_I3C_MCUX_LOG_LEVEL);
 	COND_CODE_0(CONFIG_I3C_NXP_TRANSFER_TIMEOUT, (K_FOREVER),	\
 	(K_MSEC(CONFIG_I3C_NXP_TRANSFER_TIMEOUT)))
 
+/* Trace macro — enable with CONFIG_IOB_TRACE=y */
+#if IS_ENABLED(CONFIG_IOB_TRACE)
+#define TRACE(...) printk(__VA_ARGS__)
+#else
+#define TRACE(...) do {} while (0)
+#endif
+
 struct mcux_i3c_config {
 	/** Common I3C Driver Config */
 	struct i3c_driver_config common;
@@ -524,9 +531,33 @@ static inline int mcux_i3c_state_wait_timeout(I3C_Type *base, uint32_t state,
  *
  * @param base Pointer to controller registers.
  */
+static inline int mcux_i3c_ibi_respond_nack(I3C_Type *base);
+
 static inline void mcux_i3c_wait_idle(struct mcux_i3c_data *dev_data, I3C_Type *base)
 {
+	int wait_loops = 0;
+
 	while (mcux_i3c_state_get(base) != I3C_MSTATUS_STATE_IDLE) {
+		uint32_t st = mcux_i3c_state_get(base);
+		bool slvstart_en = !!(base->MINTSET & I3C_MINTSET_SLVSTART_MASK);
+
+		if (wait_loops < 3 || (wait_loops % 100) == 0) {
+			TRACE("[i3c] wait_idle: loop=%d state=0x%x slvstart=%d\n",
+			       wait_loops, (unsigned)st, slvstart_en);
+		}
+		wait_loops++;
+
+		/*
+		 * If bus is in SLVREQ (target requesting IBI/HJ) and
+		 * the SLVSTART interrupt is disabled, no ISR will fire
+		 * and the IBI workqueue will never run.  NACK the
+		 * request directly — we already hold the mutex.
+		 */
+		if (st == I3C_MSTATUS_STATE_SLVREQ && !slvstart_en) {
+			base->MSTATUS = I3C_MSTATUS_SLVSTART_MASK;
+			mcux_i3c_ibi_respond_nack(base);
+			continue;
+		}
 		k_condvar_wait(&dev_data->condvar,
 				     &dev_data->lock,
 				     K_FOREVER);
@@ -814,22 +845,28 @@ static int mcux_i3c_recover_bus(const struct device *dev)
 		mcux_i3c_request_emit_stop(dev->data, base, true);
 	};
 
-	/* Exhaust all target initiated IBI */
-	while (mcux_i3c_status_is_set(base, I3C_MSTATUS_SLVSTART_MASK)) {
-		/* Tell the controller to perform auto IBI. */
-		if (mcux_i3c_request_auto_ibi(base) == -ETIMEDOUT) {
-			break;
+	/*
+	 * Exhaust all target initiated IBI / Hot-Join with NACK.
+	 *
+	 * Using IBI_ACK_NACK (REQUEST=3) — the same mechanism the
+	 * driver uses in mcux_i3c_ibi_respond_nack().  AUTO_IBI
+	 * (REQUEST=7) may ignore the IBIRESP field and always ACK,
+	 * which lets targets re-assert immediately.
+	 *
+	 * Devices that need to join will be picked up by ENTDAA.
+	 */
+	{
+		int drain = 0;
+
+		while (mcux_i3c_status_is_set(base,
+					      I3C_MSTATUS_SLVSTART_MASK) &&
+		       drain < 20) {
+			base->MSTATUS = I3C_MSTATUS_SLVSTART_MASK;
+			mcux_i3c_ibi_respond_nack(base);
+			mcux_i3c_fifo_rx_drain(dev);
+			k_busy_wait(100);
+			drain++;
 		}
-
-		/* Once auto IBI is done, discard bytes in FIFO. */
-		mcux_i3c_fifo_rx_drain(dev);
-
-		/*
-		 * There might be other IBIs waiting.
-		 * So pause a bit to let other targets initiates
-		 * their IBIs.
-		 */
-		k_busy_wait(100);
 	}
 
 	if (reg32_poll_timeout(&base->MSTATUS, I3C_MSTATUS_STATE_MASK,
@@ -858,6 +895,7 @@ static int mcux_i3c_do_one_xfer_read(I3C_Type *base, struct mcux_i3c_data *data,
 {
 	int ret = 0;
 	int offset = 0;
+	bool complete = false;
 
 	while (offset < buf_sz) {
 		/*
@@ -872,6 +910,7 @@ static int mcux_i3c_do_one_xfer_read(I3C_Type *base, struct mcux_i3c_data *data,
 					LOG_DBG("Target data complete, offset %d buf_sz %d", offset,
 						buf_sz);
 					ret = offset;
+					complete = true;
 					break;
 				}
 
@@ -891,8 +930,13 @@ static int mcux_i3c_do_one_xfer_read(I3C_Type *base, struct mcux_i3c_data *data,
 			}
 		}
 
-		/* Done reading all data */
-		if (ret > 0) {
+		/*
+		 * Done reading all data.  Use the 'complete' flag
+		 * instead of 'ret > 0' so that a zero-byte COMPLETE
+		 * (e.g. IBI won arbitration during START) also
+		 * terminates the loop.
+		 */
+		if (complete) {
 			break;
 		}
 
@@ -995,7 +1039,9 @@ static int mcux_i3c_do_one_xfer(I3C_Type *base, struct mcux_i3c_data *data,
 
 	/* Emit START if so desired */
 	if (emit_start) {
+		TRACE("[drv] emit_start addr=0x%02x %s\n", addr, is_read ? "R" : "W");
 		ret = mcux_i3c_request_emit_start(data, base, addr, is_i2c, is_read, buf_sz);
+		TRACE("[drv] emit_start: %d\n", ret);
 		if (ret != 0) {
 			emit_stop = true;
 
@@ -1009,7 +1055,9 @@ static int mcux_i3c_do_one_xfer(I3C_Type *base, struct mcux_i3c_data *data,
 	}
 
 	if (is_read) {
+		TRACE("[drv] xfer_read start (%u bytes)\n", (unsigned)buf_sz);
 		ret = mcux_i3c_do_one_xfer_read(base, data, buf, buf_sz);
+		TRACE("[drv] xfer_read: %d\n", ret);
 	} else {
 		ret = mcux_i3c_do_one_xfer_write(base, data, buf, buf_sz, no_ending);
 	}
@@ -1078,7 +1126,11 @@ static int mcux_i3c_transfer(const struct device *dev,
 
 	k_mutex_lock(&dev_data->lock, K_FOREVER);
 
+	TRACE("[drv] xfer: addr=0x%02x msgs=%d state=0x%lx\n",
+	       target->dynamic_addr, num_msgs,
+	       (unsigned long)mcux_i3c_state_get(base));
 	mcux_i3c_wait_idle(dev_data, base);
+	TRACE("[drv] xfer: wait_idle done\n");
 
 	mcux_i3c_xfer_reset(base);
 
@@ -1139,9 +1191,13 @@ static int mcux_i3c_transfer(const struct device *dev,
 			send_broadcast = false;
 		}
 
+		TRACE("[drv] do_one_xfer: addr=0x%02x %s len=%u emit_start=%d\n",
+		       target->dynamic_addr, is_read ? "R" : "W",
+		       (unsigned)msgs[i].len, emit_start);
 		ret = mcux_i3c_do_one_xfer(base, dev_data, target->dynamic_addr, false,
 					   msgs[i].buf, msgs[i].len,
 					   is_read, emit_start, emit_stop, no_ending);
+		TRACE("[drv] do_one_xfer: ret=%d\n", ret);
 		if (ret < 0) {
 			goto out_xfer_i3c_stop_unlock;
 		}
@@ -1190,12 +1246,46 @@ static int mcux_i3c_do_daa(const struct device *dev)
 
 	k_mutex_lock(&data->lock, K_FOREVER);
 
+	TRACE("[i3c] DAA: pre-drain start\n");
+
+	/*
+	 * Drain pending IBIs / Hot-Joins before waiting for IDLE.
+	 *
+	 * With the mutex held the IBI workqueue cannot run, so we must
+	 * service any pending target request directly at register level.
+	 * Disable the SLVSTART interrupt first to prevent the ISR from
+	 * trying to enqueue work that would deadlock on the mutex.
+	 *
+	 * NACK all requests so targets release the bus.  Devices that
+	 * need to join will be picked up by the ENTDAA that follows.
+	 */
+	base->MINTCLR = I3C_MINTCLR_SLVSTART_MASK;
+	{
+		int drain = 0;
+
+		while ((mcux_i3c_state_get(base) == I3C_MSTATUS_STATE_SLVREQ ||
+			mcux_i3c_status_is_set(base, I3C_MSTATUS_SLVSTART_MASK))
+		       && drain < 20) {
+			base->MSTATUS = I3C_MSTATUS_SLVSTART_MASK;
+			mcux_i3c_ibi_respond_nack(base);
+			mcux_i3c_fifo_rx_drain(dev);
+			k_busy_wait(100);
+			drain++;
+		}
+	}
+
 	ret = mcux_i3c_state_wait_timeout(base, I3C_MSTATUS_STATE_IDLE, 100, 100000);
+	TRACE("[i3c] DAA: wait_idle=%d state=0x%x\n", ret,
+	       (unsigned)(base->MSTATUS & I3C_MSTATUS_STATE_MASK));
 	if (ret == -ETIMEDOUT) {
+		base->MINTSET = I3C_MINTSET_SLVSTART_MASK;
 		goto out_daa_unlock;
 	}
 
 	LOG_DBG("DAA: ENTDAA");
+
+	/* Restore SLVSTART before saving mask (was cleared by pre-DAA drain) */
+	base->MINTSET = I3C_MINTSET_SLVSTART_MASK;
 
 	/* Disable I3C IRQ sources while we configure stuff. */
 	intmask = mcux_i3c_interrupt_disable(base);
@@ -1204,6 +1294,9 @@ static int mcux_i3c_do_daa(const struct device *dev)
 
 	/* Emit process DAA */
 	mcux_i3c_request_daa(base);
+
+	uint32_t daa_spin = 0;
+	int daa_nack_count = 0;
 
 	/* Loop until no more responses from devices */
 	do {
@@ -1217,6 +1310,65 @@ static int mcux_i3c_do_daa(const struct device *dev)
 				goto out_daa;
 			}
 
+			/*
+			 * Recover from IBI assertions during DAA.
+			 *
+			 * A device assigned an address earlier in this
+			 * DAA session may immediately assert IBI (e.g.
+			 * on-board P3T1755 sensor).  Two cases:
+			 *
+			 * 1) Controller detects SLVREQ before starting
+			 *    the next DAA frame.
+			 * 2) Controller is already in DAA state and the
+			 *    IBI corrupts the ENTDAA handshake — the
+			 *    inner loop spins without MCTRLDONE.
+			 *
+			 * In both cases: force the controller back to
+			 * idle, NACK the IBI (target must release per
+			 * I3C spec 5.1.10.2.4), and restart DAA.
+			 */
+			{
+				bool need_recovery = false;
+				uint32_t st = mcux_i3c_state_get(base);
+
+				if (st == I3C_MSTATUS_STATE_SLVREQ) {
+					need_recovery = true;
+				} else if (++daa_spin > 100000) {
+					need_recovery = true;
+					daa_spin = 0;
+				}
+
+				if (need_recovery) {
+					if (++daa_nack_count > 10) {
+						ret = -ETIMEDOUT;
+						goto out_daa;
+					}
+
+					st = mcux_i3c_state_get(base);
+					if (st != I3C_MSTATUS_STATE_IDLE &&
+					    st != I3C_MSTATUS_STATE_SLVREQ) {
+						base->MCTRL =
+							I3C_MCTRL_REQUEST_FORCE_EXIT;
+						k_busy_wait(10);
+					}
+
+					if (mcux_i3c_status_is_set(base,
+						I3C_MSTATUS_SLVSTART_MASK) ||
+					    mcux_i3c_state_get(base) ==
+						I3C_MSTATUS_STATE_SLVREQ) {
+						base->MSTATUS =
+							I3C_MSTATUS_SLVSTART_MASK;
+						mcux_i3c_ibi_respond_nack(base);
+						mcux_i3c_fifo_rx_drain(dev);
+					}
+
+					mcux_i3c_errwarn_clear_all_nowait(base);
+					mcux_i3c_status_clear_all(base);
+					mcux_i3c_request_daa(base);
+					continue;
+				}
+			}
+
 			rx_count = mcux_i3c_fifo_rx_count_get(base);
 			while (mcux_i3c_status_is_set(base, I3C_MSTATUS_RXPEND_MASK) &&
 			       (rx_count != 0U)) {
@@ -1226,6 +1378,22 @@ static int mcux_i3c_do_daa(const struct device *dev)
 				rx_count--;
 			}
 		} while (!mcux_i3c_status_is_set(base, I3C_MSTATUS_MCTRLDONE_MASK));
+
+		/*
+		 * Drain any remaining bytes from the RX FIFO.
+		 *
+		 * There is a race between RXPEND and MCTRLDONE: the last
+		 * byte(s) of the ENTDAA response (typically DCR) may land
+		 * in the FIFO after the RXPEND check but before MCTRLDONE
+		 * breaks the inner loop.  Without this drain the leftover
+		 * byte(s) shift all subsequent device data by one position,
+		 * corrupting PID/BCR/DCR for every device after the first.
+		 */
+		while (rx_size < sizeof(rx_buf) &&
+		       mcux_i3c_status_is_set(base, I3C_MSTATUS_RXPEND_MASK)) {
+			rx_buf[rx_size++] = (uint8_t)(base->MRDATAB &
+						      I3C_MRDATAB_VALUE_MASK);
+		}
 
 		mcux_i3c_status_clear(base, I3C_MSTATUS_MCTRLDONE_MASK);
 
@@ -1313,6 +1481,36 @@ out_daa:
 	mcux_i3c_errwarn_clear_all_nowait(base);
 	mcux_i3c_status_clear_all(base);
 
+	/*
+	 * Drain pending IBIs with NACK after DAA.
+	 *
+	 * IBI-capable devices (e.g. on-board sensors like P3T1755) may
+	 * assert IBI immediately after receiving a dynamic address during
+	 * ENTDAA.  If left unhandled, SDA stays low and all subsequent
+	 * bus operations (CCCs, private transfers) hang.
+	 *
+	 * NACKing tells the target to release the bus and not retry
+	 * until the controller sends an ENEC command (I3C spec 5.1.10.2.4).
+	 *
+	 * This runs at register level with interrupts disabled, so it
+	 * does not depend on the workqueue or thread scheduling.
+	 */
+	k_busy_wait(100);
+	{
+		int drain = 0;
+
+		while (mcux_i3c_status_is_set(base, I3C_MSTATUS_SLVSTART_MASK)
+		       && drain < 20) {
+			base->MSTATUS = I3C_MSTATUS_SLVSTART_MASK;
+			mcux_i3c_ibi_respond_nack(base);
+			mcux_i3c_fifo_rx_drain(dev);
+			k_busy_wait(100);
+			drain++;
+		}
+	}
+
+	TRACE("[i3c] DAA: post-drain done, ret=%d\n", ret);
+
 	/* Re-Enable I3C IRQ sources. */
 	mcux_i3c_interrupt_enable(base, intmask);
 
@@ -1354,6 +1552,17 @@ static int mcux_i3c_do_ccc(const struct device *dev,
 	}
 
 	k_mutex_lock(&data->lock, K_FOREVER);
+
+	/*
+	 * If a target is holding SDA low (IBI/HJ) and SLVSTART is
+	 * disabled, the workqueue cannot clear it.  NACK directly
+	 * so the CCC can proceed.
+	 */
+	if (mcux_i3c_state_get(base) == I3C_MSTATUS_STATE_SLVREQ &&
+	    !(base->MINTSET & I3C_MINTSET_SLVSTART_MASK)) {
+		base->MSTATUS = I3C_MSTATUS_SLVSTART_MASK;
+		mcux_i3c_ibi_respond_nack(base);
+	}
 
 	mcux_i3c_xfer_reset(base);
 
@@ -1481,6 +1690,32 @@ static void mcux_i3c_ibi_work(struct k_work *work)
 		goto out_ibi_work;
 	};
 
+	/*
+	 * Before AUTO_IBI (which always ACKs), check whether this IBI
+	 * should be NACKed.  When in SLVREQ state, MSTATUS already
+	 * contains the requesting target address and IBI type.
+	 *
+	 * NACK IBIs from targets that have no registered callback.
+	 * ACKing would let them re-assert immediately after STOP, and
+	 * since SLVSTART won't be re-enabled for callback-less targets,
+	 * the bus would deadlock (SDA held low, no ISR to clear it).
+	 */
+	mstatus = base->MSTATUS;
+	ibitype = mstatus & I3C_MSTATUS_IBITYPE_MASK;
+	ibiaddr = (mstatus & I3C_MSTATUS_IBIADDR_MASK) >> I3C_MSTATUS_IBIADDR_SHIFT;
+
+	if (ibitype == I3C_MSTATUS_IBITYPE_IBI) {
+		target = i3c_dev_list_i3c_addr_find(dev, (uint8_t)ibiaddr);
+		if (target != NULL && target->ibi_cb == NULL) {
+			LOG_DBG("IBI from addr 0x%02x with no callback, NACKing",
+				ibiaddr);
+			base->MSTATUS = I3C_MSTATUS_SLVSTART_MASK;
+			mcux_i3c_ibi_respond_nack(base);
+			mcux_i3c_request_emit_stop(data, base, true);
+			goto out_ibi_work;
+		}
+	}
+
 	/* IBIWON maybe set before request auto IBI causing it to return immediately
 	 * Thus clear IBIWON before requesting AUTO IBI
 	 */
@@ -1598,8 +1833,22 @@ static void mcux_i3c_ibi_work(struct k_work *work)
 out_ibi_work:
 	k_mutex_unlock(&data->lock);
 
-	/* Re-enable target initiated IBI interrupt. */
-	base->MINTSET = I3C_MINTSET_SLVSTART_MASK;
+	/*
+	 * Re-enable SLVSTART only when the IBI came from a device with
+	 * a registered callback, from an unknown address, or was a
+	 * non-IBI type (HJ / MR).
+	 *
+	 * Known targets without a callback that ignore NACK would
+	 * otherwise cause an interrupt storm (ISR → work → NACK →
+	 * re-enable → ISR → ...) that starves all other threads.
+	 *
+	 * When SLVSTART is left disabled, mcux_i3c_wait_idle() and the
+	 * CCC path handle any pending SLVREQ by NACKing directly at
+	 * register level before bus operations.
+	 */
+	if (target == NULL || target->ibi_cb != NULL) {
+		base->MINTSET = I3C_MINTSET_SLVSTART_MASK;
+	}
 }
 
 static void mcux_i3c_ibi_rules_setup(struct mcux_i3c_data *data,
@@ -2038,14 +2287,18 @@ static int mcux_i3c_init(const struct device *dev)
 	config->irq_config_func(dev);
 
 	/* Just in case the bus is not in idle. */
+	TRACE("[i3c] recover_bus start\n");
 	ret = mcux_i3c_recover_bus(dev);
+	TRACE("[i3c] recover_bus done: %d\n", ret);
 	if (ret != 0) {
 		ret = -EIO;
 		goto err_out;
 	}
 
 	/* Perform bus initialization */
+	TRACE("[i3c] i3c_bus_init start\n");
 	ret = i3c_bus_init(dev, &config->common.dev_list);
+	TRACE("[i3c] i3c_bus_init done: %d\n", ret);
 
 err_out:
 	return ret;
