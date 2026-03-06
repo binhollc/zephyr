@@ -1468,6 +1468,7 @@ static int mcux_i3c_do_daa(const struct device *dev)
 
 			/* Emit process DAA again to send the address to the device */
 			base->MWDATAB = dyn_addr;
+			__DMB(); /* ensure MWDATAB write retires before DAA trigger */
 			mcux_i3c_request_daa(base);
 
 			LOG_DBG("PID 0x%04x%08x assigned dynamic address 0x%02x",
