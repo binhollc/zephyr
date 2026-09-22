@@ -69,9 +69,12 @@ LOG_MODULE_REGISTER(i3c_mcux, CONFIG_I3C_MCUX_LOG_LEVEL);
 	COND_CODE_0(CONFIG_I3C_NXP_TRANSFER_TIMEOUT, (K_FOREVER),	\
 	(K_MSEC(CONFIG_I3C_NXP_TRANSFER_TIMEOUT)))
 
-/* Trace macro — enable with CONFIG_IOB_TRACE=y */
+/* Trace macro — enable with CONFIG_IOB_TRACE=y.
+ * Uses LOG_DBG (deferred) instead of printk (synchronous) so that
+ * trace output does not block ISR/work paths and skew I3C timing.
+ */
 #if IS_ENABLED(CONFIG_IOB_TRACE)
-#define TRACE(...) printk(__VA_ARGS__)
+#define TRACE(...) LOG_INF(__VA_ARGS__)
 #else
 #define TRACE(...) do {} while (0)
 #endif
@@ -325,8 +328,17 @@ static inline int mcux_i3c_status_wait_timeout(I3C_Type *base, uint32_t mask,
  */
 static inline void mcux_i3c_status_clear(I3C_Type *base, uint32_t mask)
 {
-	/* Try to clear bit until it is cleared */
-	while (1) {
+	/*
+	 * Try to clear W1C bits in MSTATUS.  Limit iterations so that
+	 * read-only status bits (e.g. ERRWARN, which reflects MERRWARN and
+	 * cannot be cleared by writing to MSTATUS) do not cause an infinite
+	 * busy-wait that starves other threads at the same priority.
+	 *
+	 * Callers that include ERRWARN in the mask must clear MERRWARN
+	 * first (via mcux_i3c_errwarn_clear_all_nowait) so that the
+	 * hardware drops ERRWARN before this loop runs.
+	 */
+	for (int _i = 0; _i < 200; _i++) {
 		base->MSTATUS = mask;
 
 		if (!mcux_i3c_status_is_set(base, mask)) {
@@ -532,10 +544,13 @@ static inline int mcux_i3c_state_wait_timeout(I3C_Type *base, uint32_t state,
  * @param base Pointer to controller registers.
  */
 static inline int mcux_i3c_ibi_respond_nack(I3C_Type *base);
+static inline void mcux_i3c_request_emit_stop(struct mcux_i3c_data *dev_data,
+					      I3C_Type *base, bool wait_stop);
 
 static inline void mcux_i3c_wait_idle(struct mcux_i3c_data *dev_data, I3C_Type *base)
 {
 	int wait_loops = 0;
+	const int max_recovery_attempts = 3;
 
 	while (mcux_i3c_state_get(base) != I3C_MSTATUS_STATE_IDLE) {
 		uint32_t st = mcux_i3c_state_get(base);
@@ -548,19 +563,65 @@ static inline void mcux_i3c_wait_idle(struct mcux_i3c_data *dev_data, I3C_Type *
 		wait_loops++;
 
 		/*
-		 * If bus is in SLVREQ (target requesting IBI/HJ) and
-		 * the SLVSTART interrupt is disabled, no ISR will fire
-		 * and the IBI workqueue will never run.  NACK the
-		 * request directly — we already hold the mutex.
+		 * If bus is in SLVREQ (target requesting IBI/HJ), NACK
+		 * the request directly — we already hold the mutex, so
+		 * ibi_work cannot be running concurrently.
+		 *
+		 * Previously this was guarded by !slvstart_en, under the
+		 * assumption that if SLVSTART is enabled the ISR+workqueue
+		 * should process the IBI.  That is wrong: k_condvar_wait()
+		 * releases the mutex, letting ibi_work run and ACK a
+		 * second IBI from the bridge — consuming the response data
+		 * before the Private Read that follows.  In posted mode
+		 * this causes the Private Read to time out (-ETIMEDOUT).
+		 *
+		 * NACKing here is always safe: any ibi_work already queued
+		 * by the SLVSTART ISR will find state=IDLE when it runs
+		 * (after we release the mutex at the end of the transfer)
+		 * and will exit at the early-out check.
 		 */
-		if (st == I3C_MSTATUS_STATE_SLVREQ && !slvstart_en) {
+		if (st == I3C_MSTATUS_STATE_SLVREQ) {
 			base->MSTATUS = I3C_MSTATUS_SLVSTART_MASK;
 			mcux_i3c_ibi_respond_nack(base);
 			continue;
 		}
-		k_condvar_wait(&dev_data->condvar,
-				     &dev_data->lock,
-				     K_FOREVER);
+
+		/*
+		 * Wait with timeout instead of K_FOREVER.  If the bus
+		 * is stuck in an unexpected state (e.g. NORMACT after a
+		 * failed STOP, or a residual DAA/IBIACK state), the
+		 * condvar may never be signalled and the thread would
+		 * deadlock.  On timeout, attempt inline recovery.
+		 */
+		if (k_condvar_wait(&dev_data->condvar,
+				   &dev_data->lock,
+				   I3C_TRANSFER_TIMEOUT_MSEC) == -EAGAIN) {
+			st = mcux_i3c_state_get(base);
+			TRACE("[i3c] wait_idle: TIMEOUT state=0x%x loop=%d\n",
+			       (unsigned)st, wait_loops);
+
+			if (st == I3C_MSTATUS_STATE_IDLE) {
+				break;
+			}
+
+			if (wait_loops > max_recovery_attempts) {
+				LOG_ERR("wait_idle: bus stuck state=0x%x after "
+					"%d attempts — aborting",
+					st, wait_loops);
+				break;
+			}
+
+			if (st == I3C_MSTATUS_STATE_NORMACT) {
+				mcux_i3c_request_emit_stop(dev_data, base,
+							   true);
+			} else if (st == I3C_MSTATUS_STATE_SLVREQ) {
+				base->MSTATUS = I3C_MSTATUS_SLVSTART_MASK;
+				mcux_i3c_ibi_respond_nack(base);
+			} else {
+				base->MCTRL = I3C_MCTRL_REQUEST_FORCE_EXIT;
+				k_busy_wait(10);
+			}
+		}
 	}
 }
 
@@ -636,10 +697,24 @@ static inline int mcux_i3c_do_request_emit_stop(struct mcux_i3c_data *dev_data, 
 
 	if (wait_stop) {
 		/*
-		 * Note that we don't exactly wait for I3C_MSTATUS_STATE_IDLE.
-		 * If there is an incoming IBI, it will get stuck forever
-		 * as state would be I3C_MSTATUS_STATE_SLVREQ.
+		 * Wait for state to leave NORMACT after EMIT_STOP.
+		 *
+		 * Normally the STOP completes in a few bus clocks (~µs).
+		 * However if a target (e.g. P3T1755 after RSTDAA) pulls
+		 * SDA low for a Hot-Join/IBI at the exact moment STOP is
+		 * being emitted, the hardware may be unable to complete the
+		 * STOP and stay in NORMACT indefinitely without setting any
+		 * MERRWARN error bit.
+		 *
+		 * To prevent an infinite busy-wait that starves all other
+		 * threads (including the log drain thread) and appears as a
+		 * hard hang with no output, limit iterations.  On timeout,
+		 * issue FORCE_EXIT to break out of the stuck state.
+		 *
+		 * 10 000 × 10 µs = 100 ms per attempt.
 		 */
+		int spin = 0;
+
 		while (reg32_test_match(&base->MSTATUS, I3C_MSTATUS_STATE_MASK,
 					I3C_MSTATUS_STATE_NORMACT)) {
 			merrwarn = mcux_i3c_has_error(dev_data);
@@ -655,6 +730,22 @@ static inline int mcux_i3c_do_request_emit_stop(struct mcux_i3c_data *dev_data, 
 				}
 				return -EIO;
 			}
+
+			if (++spin >= 10000) {
+				/*
+				 * Hardware stuck in NORMACT — force-exit the
+				 * state machine so callers can attempt recovery.
+				 */
+				LOG_WRN("emit_stop: NORMACT stuck after %d µs, "
+					"forcing exit (MSTATUS=0x%08x "
+					"MERRWARN=0x%08x)",
+					spin * 10, base->MSTATUS,
+					base->MERRWARN);
+				base->MCTRL = I3C_MCTRL_REQUEST_FORCE_EXIT;
+				k_busy_wait(100);
+				return -ETIMEDOUT;
+			}
+
 			k_busy_wait(10);
 		}
 	}
@@ -783,8 +874,19 @@ static inline void mcux_i3c_fifo_flush(I3C_Type *base)
  */
 static inline void mcux_i3c_xfer_reset(I3C_Type *base)
 {
-	mcux_i3c_status_clear_all(base);
+	/*
+	 * Clear MERRWARN before status_clear_all().
+	 *
+	 * MSTATUS.ERRWARN is read-only: it reflects whether MERRWARN is
+	 * non-zero and cannot be cleared by writing to MSTATUS.  If MERRWARN
+	 * still holds a previous error (e.g. a TIMEOUT from the last IBI
+	 * read), status_clear_all() would spin forever on ERRWARN.
+	 *
+	 * Clearing MERRWARN first causes the hardware to drop ERRWARN in
+	 * MSTATUS, so status_clear_all() exits in one pass.
+	 */
 	mcux_i3c_errwarn_clear_all_nowait(base);
+	mcux_i3c_status_clear_all(base);
 	mcux_i3c_fifo_flush(base);
 }
 
@@ -833,8 +935,30 @@ struct i3c_device_desc *mcux_i3c_device_find(const struct device *dev,
 static int mcux_i3c_recover_bus(const struct device *dev)
 {
 	const struct mcux_i3c_config *config = dev->config;
+	struct mcux_i3c_data *dev_data = dev->data;
 	I3C_Type *base = config->base;
 	int ret = 0;
+
+	/*
+	 * Disable SLVSTART interrupt FIRST to prevent the ISR from
+	 * enqueuing new IBI work while we recover at register level.
+	 * Without this, the IBI workqueue and recover_bus race on the
+	 * same MSTATUS/MCTRL registers — recover_bus runs without the
+	 * mutex, so both paths can collide.
+	 *
+	 * Any in-progress ibi_work will finish its current cycle and
+	 * release the mutex.  DAA re-enables SLVSTART later.
+	 */
+	base->MINTCLR = I3C_MINTCLR_SLVSTART_MASK;
+
+	/*
+	 * Wait for any in-progress IBI work to release the mutex.
+	 * This ensures we don't touch registers while ibi_work is
+	 * still driving the controller.
+	 */
+	if (k_mutex_lock(&dev_data->lock, K_MSEC(1000)) == 0) {
+		k_mutex_unlock(&dev_data->lock);
+	}
 
 	/*
 	 * If the controller is in NORMACT state, tells it to emit STOP
@@ -842,7 +966,7 @@ static int mcux_i3c_recover_bus(const struct device *dev)
 	 * target initiated IBIs.
 	 */
 	if (mcux_i3c_state_get(base) == I3C_MSTATUS_STATE_NORMACT) {
-		mcux_i3c_request_emit_stop(dev->data, base, true);
+		mcux_i3c_request_emit_stop(dev_data, base, true);
 	};
 
 	/*
@@ -1302,12 +1426,24 @@ static int mcux_i3c_do_daa(const struct device *dev)
 	do {
 		/* Loop to grab data from devices (Provisioned ID, BCR and DCR) */
 		do {
-			if (mcux_i3c_has_error(data)) {
-				LOG_ERR("DAA recv error");
+			/*
+			 * Check for bus errors directly from the hardware
+			 * register.  mcux_i3c_has_error() relies on the ISR
+			 * to snapshot MERRWARN into data->merrwarn_reg, but
+			 * interrupts are disabled during DAA, so it would
+			 * always return 0.  Read the register directly.
+			 */
+			{
+				uint32_t daa_err = base->MERRWARN &
+						   ~I3C_MERRWARN_TIMEOUT_MASK;
 
-				ret = -EIO;
-
-				goto out_daa;
+				if (daa_err) {
+					LOG_ERR("DAA recv error: MERRWARN=0x%08x",
+						daa_err);
+					base->MERRWARN = daa_err;
+					ret = -EIO;
+					goto out_daa;
+				}
 			}
 
 			/*
@@ -1470,6 +1606,64 @@ static int mcux_i3c_do_daa(const struct device *dev)
 			base->MWDATAB = dyn_addr;
 			__DMB(); /* ensure MWDATAB write retires before DAA trigger */
 			mcux_i3c_request_daa(base);
+
+			/*
+			 * Check for NACK after dynamic address assignment.
+			 *
+			 * The NXP I3C peripheral has a hardware errata where
+			 * it occasionally emits an illegal Repeated Start (Sr)
+			 * between the PID read and the DA write during ENTDAA.
+			 * This violates I3C spec v1.2 (no Sr between PID and
+			 * DA) and causes compliant targets to NACK the address.
+			 *
+			 * Without this check, the controller assumes the DA
+			 * was accepted and proceeds with a stale address —
+			 * all subsequent transactions to that target fail.
+			 *
+			 * Read MERRWARN directly because interrupts are off.
+			 */
+			{
+				uint32_t nack_wait = 0;
+
+				while (!mcux_i3c_status_is_set(base,
+					I3C_MSTATUS_MCTRLDONE_MASK) &&
+				       !mcux_i3c_status_is_set(base,
+					I3C_MSTATUS_COMPLETE_MASK) &&
+				       nack_wait < 100000) {
+					nack_wait++;
+				}
+
+				uint32_t da_err = base->MERRWARN;
+
+				if (da_err & I3C_MERRWARN_NACK_MASK) {
+					LOG_WRN("DAA: target NACKed DA 0x%02x "
+						"(PID 0x%04x%08x) — will retry",
+						dyn_addr, vendor_id, part_no);
+
+					base->MERRWARN = da_err;
+
+					/* Revert address assignment */
+					i3c_addr_slots_mark_free(
+						&data->common.attached_dev.addr_slots,
+						dyn_addr);
+					target->dynamic_addr = 0;
+
+					/* STOP, clear, restart DAA */
+					mcux_i3c_request_emit_stop(data, base,
+								   true);
+					mcux_i3c_errwarn_clear_all_nowait(base);
+					mcux_i3c_status_clear_all(base);
+					mcux_i3c_request_daa(base);
+
+					daa_nack_count++;
+					if (daa_nack_count > 10) {
+						LOG_ERR("DAA: too many NACKs");
+						ret = -ETIMEDOUT;
+						goto out_daa;
+					}
+					continue;
+				}
+			}
 
 			LOG_DBG("PID 0x%04x%08x assigned dynamic address 0x%02x",
 				vendor_id, part_no, dyn_addr);
@@ -1680,7 +1874,11 @@ static void mcux_i3c_ibi_work(struct k_work *work)
 	uint32_t mstatus, ibitype, ibiaddr;
 	int ret;
 
+	TRACE("[ibi] work start: num_addr=%u MSTATUS=0x%08x\n",
+	      data->ibi.num_addr, base->MSTATUS);
 	k_mutex_lock(&data->lock, K_FOREVER);
+	TRACE("[ibi] mutex acquired: state=0x%x\n",
+	      (unsigned)mcux_i3c_state_get(base));
 
 	if (mcux_i3c_state_get(base) != I3C_MSTATUS_STATE_SLVREQ) {
 		LOG_DBG("IBI work %p running not because of IBI", work);
@@ -1843,12 +2041,26 @@ out_ibi_work:
 	 * otherwise cause an interrupt storm (ISR → work → NACK →
 	 * re-enable → ISR → ...) that starves all other threads.
 	 *
-	 * When SLVSTART is left disabled, mcux_i3c_wait_idle() and the
-	 * CCC path handle any pending SLVREQ by NACKing directly at
-	 * register level before bus operations.
+	 * Also guard on data->ibi.num_addr > 0: mcux_i3c_ibi_disable()
+	 * decrements num_addr BEFORE acquiring the mutex for the DISEC CCC.
+	 * If we re-enable SLVSTART after seeing num_addr=0, the disabler
+	 * thread gets a new ibi_work competitor for every IBI the bridge
+	 * re-asserts — a priority-inversion starvation loop that permanently
+	 * hangs the init thread.  When num_addr=0, SLVSTART stays off;
+	 * mcux_i3c_wait_idle() and the CCC path NACK any residual SLVREQ
+	 * directly at register level.
 	 */
-	if (target == NULL || target->ibi_cb != NULL) {
-		base->MINTSET = I3C_MINTSET_SLVSTART_MASK;
+	{
+		bool will_reenable = data->ibi.num_addr > 0 &&
+				     (target == NULL || target->ibi_cb != NULL);
+
+		TRACE("[ibi] out: num_addr=%u ibi_cb=%s slvstart=%s\n",
+		      data->ibi.num_addr,
+		      (target && target->ibi_cb) ? "set" : "null",
+		      will_reenable ? "re-enable" : "keep-off");
+		if (will_reenable) {
+			base->MINTSET = I3C_MINTSET_SLVSTART_MASK;
+		}
 	}
 }
 
