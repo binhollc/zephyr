@@ -937,7 +937,13 @@ static int mcux_i3c_do_one_xfer_write(I3C_Type *base, struct mcux_i3c_data *data
 	int ret = 0;
 
 	while (remaining > 0) {
-		if (base->MDATACTRL & I3C_MDATACTRL_TXFULL_MASK) {
+		/*
+		 * Re-check after every wake-up: device_sync_sem is also given
+		 * on RXPEND, so a count left over from an earlier transfer can
+		 * return here with the FIFO still full, and a byte written to
+		 * a full FIFO is dropped (seen: a 16-byte write went out as 15).
+		 */
+		while (base->MDATACTRL & I3C_MDATACTRL_TXFULL_MASK) {
 			/* Enable TX buffer ready interrupt */
 			base->MINTSET = I3C_MSTATUS_TXNOTFULL_MASK;
 
@@ -946,6 +952,9 @@ static int mcux_i3c_do_one_xfer_write(I3C_Type *base, struct mcux_i3c_data *data
 			if (ret) {
 				break;
 			}
+		}
+		if (ret) {
+			break;
 		}
 
 		if ((remaining > 1) || no_ending) {
@@ -992,6 +1001,9 @@ static int mcux_i3c_do_one_xfer(I3C_Type *base, struct mcux_i3c_data *data,
 
 	mcux_i3c_status_clear_all(base);
 	mcux_i3c_errwarn_clear_all_nowait(base);
+
+	/* Drop wake-ups left over from an earlier transfer. */
+	k_sem_reset(&data->device_sync_sem);
 
 	/* Emit START if so desired */
 	if (emit_start) {
