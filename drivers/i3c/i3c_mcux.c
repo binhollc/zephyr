@@ -570,8 +570,18 @@ static int mcux_i3c_request_emit_start(struct mcux_i3c_data *dev_data, I3C_Type 
 	ret = mcux_i3c_status_wait_clear_timeout(base, I3C_MSTATUS_MCTRLDONE_MASK,
 						 1000);
 	if (ret == 0) {
-		/* Check for NACK */
-		if (mcux_i3c_has_error(dev_data) & I3C_MERRWARN_NACK_MASK) {
+		/*
+		 * Check for NACK in MERRWARN itself, then in the ISR snapshot
+		 * (the ISR clears MERRWARN once it has run). The ERRWARN
+		 * interrupt often has not run yet when MCTRLDONE is seen; a
+		 * NACK missed here sent a read on to wait for RX data until
+		 * I3C_TRANSFER_TIMEOUT_MSEC, so a NACKed read returned
+		 * -ETIMEDOUT after 500 ms instead of -ENODEV at once.
+		 */
+		uint32_t merrwarn = base->MERRWARN;
+
+		merrwarn |= mcux_i3c_has_error(dev_data);
+		if (merrwarn & I3C_MERRWARN_NACK_MASK) {
 			ret = -ENODEV;
 		}
 	}
@@ -1094,6 +1104,13 @@ static int mcux_i3c_transfer(const struct device *dev,
 
 	mcux_i3c_xfer_reset(base);
 
+	/*
+	 * An ERRWARN interrupt that ran after the last transfer's clean-up
+	 * (e.g. for the NACK of a read that already returned -ENODEV) must
+	 * not fail this one.
+	 */
+	(void)mcux_i3c_has_error(dev_data);
+
 	/* Iterate over all the messages */
 	for (int i = 0; i < num_msgs; i++) {
 		bool is_read = (msgs[i].flags & I3C_MSG_RW_MASK) == I3C_MSG_READ;
@@ -1584,6 +1601,7 @@ static int mcux_i3c_do_ccc(const struct device *dev,
 	k_mutex_lock(&data->lock, K_FOREVER);
 
 	mcux_i3c_xfer_reset(base);
+	(void)mcux_i3c_has_error(data);   /* stale snapshot, see mcux_i3c_transfer() */
 
 	LOG_DBG("CCC[0x%02x]", payload->ccc.id);
 
@@ -2301,6 +2319,13 @@ static int mcux_i3c_i2c_api_transfer(const struct device *dev,
 	mcux_i3c_wait_idle(dev_data, base);
 
 	mcux_i3c_xfer_reset(base);
+
+	/*
+	 * An ERRWARN interrupt that ran after the last transfer's clean-up
+	 * (e.g. for the NACK of a read that already returned -ENODEV) must
+	 * not fail this one.
+	 */
+	(void)mcux_i3c_has_error(dev_data);
 
 	/* Iterate over all the messages */
 	for (int i = 0; i < num_msgs; i++) {
