@@ -1168,6 +1168,115 @@ out_xfer_i3c:
 	return ret;
 }
 
+/*
+ * DAA robustness.
+ *
+ * - I3C IRQ sources are disabled for the whole DAA, so errors are read from
+ *   MERRWARN directly: data->merrwarn_reg is an ISR snapshot and stays 0.
+ * - The window between the last PID/BCR/DCR byte and the dynamic address
+ *   write is kept short (IRQs locked, device attach deferred). If the
+ *   controller waits too long there, it emits an illegal Repeated Start
+ *   before the address and a compliant target NACKs it (seen on MCXN947 with
+ *   a PIC18F16Q20 I3C target: ~99 us SCL-high stall, then Sr, then NACK).
+ * - A NACKed address restarts ENTDAA (the target has left DAA); a stalled
+ *   handshake is forced out. Both are bounded, so DAA fails instead of
+ *   spinning forever with the controller mutex held. On retry the same
+ *   descriptor and address are reused (no pool descriptor leaks), and on
+ *   any failure the controller is forced out of DAA and unconfirmed pool
+ *   descriptors are freed.
+ * - The RX FIFO is drained once more after MCTRLDONE: a late DCR byte would
+ *   otherwise shift the PID/BCR/DCR of the next device.
+ * - Pending IBIs / Hot-Join requests are NACKed before and after DAA.
+ */
+#define MCUX_I3C_DAA_SPIN_MAX		100000U
+/*
+ * First dynamic address handed out when the device has no fixed address.
+ * Seen on the bus: at the start of the address byte the controller
+ * sometimes drives the first data bit onto SDA ~40 ns before it pulls SCL
+ * low. With that bit at 0 (any address below 0x40) SDA falls while SCL is
+ * high, i.e. a START, and the target NACKs the address. With bit 6 of the
+ * address set SDA stays high there and the race cannot produce a START.
+ */
+#define MCUX_I3C_DAA_ADDR_FIRST		0x40U
+#define MCUX_I3C_DAA_RESTART_MAX	16
+#define MCUX_I3C_DAA_IBI_DRAIN_MAX	20
+
+/* NACK target requests (IBI / Hot-Join) so the bus goes back to idle. */
+static void mcux_i3c_daa_nack_requests(const struct device *dev, I3C_Type *base)
+{
+	for (int i = 0; i < MCUX_I3C_DAA_IBI_DRAIN_MAX; i++) {
+		if ((mcux_i3c_state_get(base) != I3C_MSTATUS_STATE_SLVREQ) &&
+		    !mcux_i3c_status_is_set(base, I3C_MSTATUS_SLVSTART_MASK)) {
+			break;
+		}
+		base->MSTATUS = I3C_MSTATUS_SLVSTART_MASK;
+		(void)mcux_i3c_ibi_respond_nack(base);
+		mcux_i3c_fifo_rx_drain(dev);
+		k_busy_wait(100);
+	}
+}
+
+/* Abandon the current ENTDAA and start a new one. */
+static void mcux_i3c_daa_restart(const struct device *dev, I3C_Type *base)
+{
+	uint32_t state = mcux_i3c_state_get(base);
+
+	if ((state != I3C_MSTATUS_STATE_IDLE) && (state != I3C_MSTATUS_STATE_SLVREQ)) {
+		base->MCTRL = I3C_MCTRL_REQUEST_FORCE_EXIT;
+		(void)mcux_i3c_state_wait_timeout(base, I3C_MSTATUS_STATE_IDLE, 1, 1000);
+	}
+	mcux_i3c_daa_nack_requests(dev, base);
+	mcux_i3c_xfer_reset(base);
+	mcux_i3c_request_daa(base);
+}
+
+/* Forget an address that was sent but never confirmed. */
+static void mcux_i3c_daa_drop(struct mcux_i3c_data *data, struct i3c_device_desc *desc,
+			      uint8_t addr)
+{
+	if (addr != 0U) {
+		i3c_addr_slots_mark_free(&data->common.attached_dev.addr_slots, addr);
+	}
+	desc->dynamic_addr = 0U;
+	if (i3c_device_desc_in_pool(desc)) {
+		i3c_device_desc_free(desc);
+	}
+}
+
+/* The target ACKed its dynamic address: record it on the bus. */
+static void mcux_i3c_daa_commit(struct mcux_i3c_data *data, struct i3c_device_desc *target)
+{
+	struct i3c_addr_slots *slots = &data->common.attached_dev.addr_slots;
+	int aret;
+
+	/*
+	 * The slot was reserved when the address was sent; attach requires it
+	 * free (-EADDRNOTAVAIL otherwise) and marks it itself.
+	 */
+	i3c_addr_slots_mark_free(slots, target->dynamic_addr);
+	aret = i3c_attach_i3c_device(target);
+
+	if ((aret != 0) && (aret != -EALREADY)) {
+		LOG_ERR("Failed to attach target 0x%02x: %d", target->dynamic_addr, aret);
+	}
+
+	/* Mark the address as I3C device (the target owns it either way) */
+	i3c_addr_slots_mark_i3c(slots, target->dynamic_addr);
+
+	/*
+	 * If the device has static address, after address assignment,
+	 * the device will not respond to the static address anymore.
+	 * So free the static one from address slots if different from
+	 * newly assigned one.
+	 */
+	if ((target->static_addr != 0U) && (target->dynamic_addr != target->static_addr)) {
+		i3c_addr_slots_mark_free(&data->common.attached_dev.addr_slots,
+					 target->static_addr);
+	}
+
+	LOG_DBG("DAA: dynamic address 0x%02x ACKed", target->dynamic_addr);
+}
+
 /**
  * @brief Perform Dynamic Address Assignment.
  *
@@ -1184,13 +1293,30 @@ static int mcux_i3c_do_daa(const struct device *dev)
 	I3C_Type *base = config->base;
 	int ret = 0;
 	uint8_t rx_buf[8] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU};
-	size_t rx_count;
 	uint8_t rx_size = 0;
 	uint32_t intmask;
+	uint32_t spin = 0U;
+	int restarts = 0;
+	/* Address sent, not yet known to be ACKed. */
+	struct i3c_device_desc *pending = NULL;
+	uint64_t pending_pid = 0U;
+	/* Address NACKed: reuse it when the same PID comes back. */
+	struct i3c_device_desc *retry = NULL;
+	uint64_t retry_pid = 0U;
+	uint8_t retry_addr = 0U;
 
 	k_mutex_lock(&data->lock, K_FOREVER);
 
+	/*
+	 * A pending IBI / Hot-Join keeps the controller out of IDLE. With the
+	 * mutex held the IBI work cannot run, so NACK it here; keep the ISR
+	 * from queueing work meanwhile.
+	 */
+	base->MINTCLR = I3C_MINTCLR_SLVSTART_MASK;
+	mcux_i3c_daa_nack_requests(dev, base);
+
 	ret = mcux_i3c_state_wait_timeout(base, I3C_MSTATUS_STATE_IDLE, 100, 100000);
+	base->MINTSET = I3C_MINTSET_SLVSTART_MASK;
 	if (ret == -ETIMEDOUT) {
 		goto out_daa_unlock;
 	}
@@ -1205,39 +1331,93 @@ static int mcux_i3c_do_daa(const struct device *dev)
 	/* Emit process DAA */
 	mcux_i3c_request_daa(base);
 
-	/* Loop until no more responses from devices */
-	do {
-		/* Loop to grab data from devices (Provisioned ID, BCR and DCR) */
+	for (;;) {
+		bool restart = false;
+		uint32_t err;
+
+		/* Grab data from devices (Provisioned ID, BCR and DCR) */
 		do {
-			if (mcux_i3c_has_error(data)) {
-				LOG_ERR("DAA recv error");
-
+			err = base->MERRWARN & ~I3C_MERRWARN_TIMEOUT_MASK;
+			if (err & I3C_MERRWARN_NACK_MASK) {
+				restart = true;
+				break;
+			}
+			if (err != 0U) {
+				LOG_ERR("DAA recv error: MERRWARN=0x%08x", err);
 				ret = -EIO;
-
 				goto out_daa;
 			}
 
-			rx_count = mcux_i3c_fifo_rx_count_get(base);
-			while (mcux_i3c_status_is_set(base, I3C_MSTATUS_RXPEND_MASK) &&
-			       (rx_count != 0U)) {
-				rx_buf[rx_size] = (uint8_t)(base->MRDATAB &
-							    I3C_MRDATAB_VALUE_MASK);
-				rx_size++;
-				rx_count--;
+			while (mcux_i3c_status_is_set(base, I3C_MSTATUS_RXPEND_MASK)) {
+				uint8_t b = (uint8_t)(base->MRDATAB & I3C_MRDATAB_VALUE_MASK);
+
+				if (rx_size < sizeof(rx_buf)) {
+					rx_buf[rx_size++] = b;
+				}
+			}
+
+			if (++spin > MCUX_I3C_DAA_SPIN_MAX) {
+				LOG_WRN("DAA: handshake stalled (state 0x%x)",
+					mcux_i3c_state_get(base));
+				restart = true;
+				break;
 			}
 		} while (!mcux_i3c_status_is_set(base, I3C_MSTATUS_MCTRLDONE_MASK));
+
+		/* A NACK can be flagged together with MCTRLDONE. */
+		if (!restart && (base->MERRWARN & I3C_MERRWARN_NACK_MASK)) {
+			restart = true;
+		}
+
+		if (restart) {
+			if (pending != NULL) {
+				LOG_WRN("DAA: dynamic address 0x%02x NACKed, restarting ENTDAA",
+					pending->dynamic_addr);
+				if ((retry != NULL) && (retry != pending)) {
+					mcux_i3c_daa_drop(data, retry, retry_addr);
+				}
+				retry = pending;
+				retry_pid = pending_pid;
+				retry_addr = pending->dynamic_addr;
+				pending->dynamic_addr = 0U;
+				pending = NULL;
+			}
+			if (++restarts > MCUX_I3C_DAA_RESTART_MAX) {
+				LOG_ERR("DAA: giving up after %d restarts", MCUX_I3C_DAA_RESTART_MAX);
+				ret = -ETIMEDOUT;
+				goto out_daa;
+			}
+			mcux_i3c_daa_restart(dev, base);
+			rx_size = 0;
+			spin = 0U;
+			continue;
+		}
+		spin = 0U;
+
+		/* The last byte(s) can land after RXPEND was sampled. */
+		while ((rx_size < sizeof(rx_buf)) &&
+		       mcux_i3c_status_is_set(base, I3C_MSTATUS_RXPEND_MASK)) {
+			rx_buf[rx_size++] = (uint8_t)(base->MRDATAB & I3C_MRDATAB_VALUE_MASK);
+		}
 
 		mcux_i3c_status_clear(base, I3C_MSTATUS_MCTRLDONE_MASK);
 
 		/* Figure out what address to assign to device */
 		if ((mcux_i3c_state_get(base) == I3C_MSTATUS_STATE_DAA) &&
 		    (mcux_i3c_status_is_set(base, I3C_MSTATUS_BETWEEN_MASK))) {
+			/* The controller moved on: the previous address was ACKed. */
+			struct i3c_device_desc *acked = pending;
 			struct i3c_device_desc *target;
 			uint16_t vendor_id;
 			uint32_t part_no;
 			uint64_t pid;
 			uint8_t dyn_addr;
+			unsigned int key;
 
+			if (rx_size != sizeof(rx_buf)) {
+				LOG_WRN("DAA: %u of %u PID/BCR/DCR bytes", rx_size,
+					(unsigned int)sizeof(rx_buf));
+			}
 			rx_size = 0;
 
 			/* Vendor ID portion of Provisioned ID */
@@ -1251,53 +1431,103 @@ static int mcux_i3c_do_daa(const struct device *dev)
 			/* ... and combine into one Provisioned ID */
 			pid = (uint64_t)vendor_id << 32U | (uint64_t)part_no;
 
-			LOG_DBG("DAA: Rcvd PID 0x%04x%08x", vendor_id, part_no);
+			/*
+			 * Keep the gap between the DCR byte and the address write
+			 * short: pick the address and send it with IRQs locked,
+			 * attach afterwards.
+			 */
+			key = irq_lock();
+			if ((retry != NULL) && (pid == retry_pid)) {
+				target = retry;
+				dyn_addr = retry_addr;
+				retry = NULL;
+				ret = 0;
+			} else {
+				ret = i3c_dev_list_daa_addr_helper(dev, pid, false, false,
+								   &target, &dyn_addr);
+				if ((ret == 0) && (target == NULL)) {
+					/* descriptor pool exhausted */
+					ret = -ENOMEM;
+				}
+				if ((ret == 0) && (dyn_addr < MCUX_I3C_DAA_ADDR_FIRST) &&
+				    (target->init_dynamic_addr != dyn_addr)) {
+					uint8_t alt = i3c_addr_slots_next_free_find(
+						&data->common.attached_dev.addr_slots,
+						MCUX_I3C_DAA_ADDR_FIRST);
 
-			ret = i3c_dev_list_daa_addr_helper(dev, pid, false, false, &target,
-							   &dyn_addr);
+					if (alt != 0U) {
+						dyn_addr = alt;
+					}
+				}
+			}
+			if (ret == 0) {
+				target->dynamic_addr = dyn_addr;
+				target->bcr = rx_buf[6];
+				target->dcr = rx_buf[7];
+
+				/* Reserve the slot now: the next target must not get it. */
+				i3c_addr_slots_mark_i3c(&data->common.attached_dev.addr_slots,
+							dyn_addr);
+
+				/* Emit process DAA again to send the address to the device */
+				base->MWDATAB = dyn_addr;
+				__DMB(); /* MWDATAB write retires before the DAA request */
+				mcux_i3c_request_daa(base);
+			}
+			irq_unlock(key);
 			if (ret != 0) {
+				LOG_ERR("DAA: no address for PID 0x%04x%08x (%d)", vendor_id,
+					part_no, ret);
 				goto out_daa;
 			}
+			pending = target;
+			pending_pid = pid;
 
-			/* Update target descriptor */
-			target->dynamic_addr = dyn_addr;
-			target->bcr = rx_buf[6];
-			target->dcr = rx_buf[7];
-
-			int aret = i3c_attach_i3c_device(target);
-
-			if (aret != 0 && aret != -EALREADY) {
-				LOG_ERR("Failed to attach target");
+			if (acked != NULL) {
+				mcux_i3c_daa_commit(data, acked);
 			}
 
-			/* Mark the address as I3C device */
-			i3c_addr_slots_mark_i3c(&data->common.attached_dev.addr_slots, dyn_addr);
-
-			/*
-			 * If the device has static address, after address assignment,
-			 * the device will not respond to the static address anymore.
-			 * So free the static one from address slots if different from
-			 * newly assigned one.
-			 */
-			if ((target->static_addr != 0U) && (dyn_addr != target->static_addr)) {
-				i3c_addr_slots_mark_free(&data->common.attached_dev.addr_slots,
-							 target->static_addr);
-			}
-
-			/* Emit process DAA again to send the address to the device */
-			base->MWDATAB = dyn_addr;
-			mcux_i3c_request_daa(base);
-
-			LOG_DBG("PID 0x%04x%08x assigned dynamic address 0x%02x",
+			LOG_DBG("DAA: PID 0x%04x%08x -> dynamic address 0x%02x",
 				vendor_id, part_no, dyn_addr);
+			continue;
 		}
 
-	} while (!mcux_i3c_status_is_set(base, I3C_MSTATUS_COMPLETE_MASK));
+		if (pending != NULL) {
+			mcux_i3c_daa_commit(data, pending);
+			pending = NULL;
+		}
+
+		if (mcux_i3c_status_is_set(base, I3C_MSTATUS_COMPLETE_MASK)) {
+			break;
+		}
+	}
+
+	if (restarts > 0) {
+		LOG_WRN("DAA: completed after %d restart(s)", restarts);
+	}
 
 out_daa:
+	if (ret != 0) {
+		/* Do not leave the controller (and the targets) mid-ENTDAA. */
+		if (mcux_i3c_state_get(base) == I3C_MSTATUS_STATE_DAA) {
+			base->MCTRL = I3C_MCTRL_REQUEST_FORCE_EXIT;
+			(void)mcux_i3c_state_wait_timeout(base, I3C_MSTATUS_STATE_IDLE, 1, 1000);
+		}
+		if (pending != NULL) {
+			mcux_i3c_daa_drop(data, pending, pending->dynamic_addr);
+		}
+	}
+	if (retry != NULL) {
+		mcux_i3c_daa_drop(data, retry, retry_addr);
+	}
+
 	/* Clear all flags. */
 	mcux_i3c_errwarn_clear_all_nowait(base);
 	mcux_i3c_status_clear_all(base);
+
+	/* A target that just got its address may raise an IBI right away. */
+	k_busy_wait(100);
+	mcux_i3c_daa_nack_requests(dev, base);
 
 	/* Re-Enable I3C IRQ sources. */
 	mcux_i3c_interrupt_enable(base, intmask);
