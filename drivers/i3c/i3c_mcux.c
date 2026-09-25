@@ -1230,12 +1230,21 @@ out_xfer_i3c:
 #define MCUX_I3C_DAA_RESTART_MAX	16
 #define MCUX_I3C_DAA_IBI_DRAIN_MAX	20
 
-/* NACK target requests (IBI / Hot-Join) so the bus goes back to idle. */
+/*
+ * NACK target requests (IBI / Hot-Join) so the bus goes back to idle.
+ *
+ * Only while the controller is in SLVREQ: a SLVSTART flag left over from a
+ * request that is already gone (state IDLE) is just cleared. An IBI_ACK_NACK
+ * request issued in IDLE is never completed and the controller then ignores
+ * every later request (EmitStartAddr, ProcessDAA) until it is re-initialized;
+ * MCTRL keeps reading REQUEST=IBI_ACK_NACK. Seen with an STM32H503 bridge on
+ * the bus: every ENTDAA "stalled" in IDLE and all CCCs failed to START.
+ */
 static void mcux_i3c_daa_nack_requests(const struct device *dev, I3C_Type *base)
 {
 	for (int i = 0; i < MCUX_I3C_DAA_IBI_DRAIN_MAX; i++) {
-		if ((mcux_i3c_state_get(base) != I3C_MSTATUS_STATE_SLVREQ) &&
-		    !mcux_i3c_status_is_set(base, I3C_MSTATUS_SLVSTART_MASK)) {
+		if (mcux_i3c_state_get(base) != I3C_MSTATUS_STATE_SLVREQ) {
+			base->MSTATUS = I3C_MSTATUS_SLVSTART_MASK;
 			break;
 		}
 		base->MSTATUS = I3C_MSTATUS_SLVSTART_MASK;
@@ -1347,6 +1356,8 @@ static int mcux_i3c_do_daa(const struct device *dev)
 	ret = mcux_i3c_state_wait_timeout(base, I3C_MSTATUS_STATE_IDLE, 100, 100000);
 	base->MINTSET = I3C_MINTSET_SLVSTART_MASK;
 	if (ret == -ETIMEDOUT) {
+		LOG_ERR("DAA: controller not idle: MSTATUS=0x%08x MERRWARN=0x%08x "
+			"MCTRL=0x%08x", base->MSTATUS, base->MERRWARN, base->MCTRL);
 		goto out_daa_unlock;
 	}
 
