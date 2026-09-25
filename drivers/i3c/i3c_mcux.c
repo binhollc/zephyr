@@ -1786,6 +1786,21 @@ static int mcux_i3c_do_ccc(const struct device *dev,
 		}
 	}
 
+#ifdef CONFIG_I3C_USE_IBI
+	/*
+	 * After a broadcast RSTDAA no target owns a dynamic address: the IBI
+	 * table (address-based) is stale. Left in place, the next owner of
+	 * one of those addresses inherits its rule and the table fills up
+	 * after a few re-enumerations. ENEC after the next DAA refills it.
+	 */
+	if ((ret >= 0) && (payload->ccc.id == I3C_CCC_RSTDAA) && (data->ibi.num_addr > 0U)) {
+		(void)memset(data->ibi.addr, 0, sizeof(data->ibi.addr));
+		data->ibi.num_addr = 0U;
+		base->MIBIRULES = 0U;
+		LOG_DBG("RSTDAA: IBI table cleared");
+	}
+#endif
+
 out_ccc_stop:
 	mcux_i3c_request_emit_stop(data, base, true);
 
@@ -2049,23 +2064,33 @@ int mcux_i3c_ibi_enable(const struct device *dev,
 	bool msb, has_mandatory_byte;
 	int ret = 0;
 
-	if (!i3c_device_is_ibi_capable(target)) {
+	if (!i3c_device_is_ibi_capable(target) || (target->dynamic_addr == 0U)) {
 		ret = -EINVAL;
 		goto out1;
+	}
+
+	/*
+	 * Already in the table: the rules are address-based, so this is the
+	 * same entry (enabled again, e.g. after a re-enumeration handed out
+	 * the same DA). Only send ENEC again. This used to fail -EINVAL and
+	 * leave the target without IBIs.
+	 */
+	for (idx = 0; idx < ARRAY_SIZE(data->ibi.addr); idx++) {
+		if (data->ibi.addr[idx] == target->dynamic_addr) {
+			i3c_events.events = I3C_CCC_EVT_INTR;
+			ret = i3c_ccc_do_events_set(target, true, &i3c_events);
+			if (ret != 0) {
+				LOG_ERR("Error sending IBI ENEC for 0x%02x (%d)",
+					target->dynamic_addr, ret);
+			}
+			goto out1;
+		}
 	}
 
 	if (data->ibi.num_addr >= ARRAY_SIZE(data->ibi.addr)) {
 		/* No more free entries in the IBI Rules table */
 		ret = -ENOMEM;
 		goto out1;
-	}
-
-	/* Check for duplicate */
-	for (idx = 0; idx < ARRAY_SIZE(data->ibi.addr); idx++) {
-		if (data->ibi.addr[idx] == target->dynamic_addr) {
-			ret = -EINVAL;
-			goto out1;
-		}
 	}
 
 	/* Disable controller interrupt while we configure IBI rules. */
