@@ -75,6 +75,9 @@ LOG_MODULE_REGISTER(i3c_mcux, CONFIG_I3C_MCUX_LOG_LEVEL);
  */
 #define MCUX_I3C_SDA_STUCK_BACKOFF_MS	100
 
+/* START requests re-sent (as a repeated START) after a target request won it. */
+#define MCUX_I3C_START_IBIWON_RETRIES	4
+
 /* Waits of 10 ms for IDLE before a transfer gives up (500 ms). */
 #define MCUX_I3C_WAIT_IDLE_TRIES	50
 
@@ -603,11 +606,35 @@ static int mcux_i3c_request_emit_start(struct mcux_i3c_data *dev_data, I3C_Type 
 
 	mctrl |= I3C_MCTRL_REQUEST_EMIT_START_ADDR | I3C_MCTRL_ADDR(addr);
 
-	base->MCTRL = mctrl;
+	/* An IBIWON left from an earlier request would look like a lost START. */
+	base->MSTATUS = I3C_MSTATUS_IBIWON_MASK;
 
-	/* Wait for controller to say the operation is done */
-	ret = mcux_i3c_status_wait_clear_timeout(base, I3C_MSTATUS_MCTRLDONE_MASK,
-						 1000);
+	for (int lost = 0;; lost++) {
+		base->MCTRL = mctrl;
+
+		/* Wait for controller to say the operation is done */
+		ret = mcux_i3c_status_wait_clear_timeout(base, I3C_MSTATUS_MCTRLDONE_MASK,
+							 1000);
+		if ((ret != 0) || !mcux_i3c_status_is_set(base, I3C_MSTATUS_IBIWON_MASK) ||
+		    (lost >= MCUX_I3C_START_IBIWON_RETRIES)) {
+			break;
+		}
+
+		/*
+		 * A target request (IBI / Hot-Join) won the arbitration of this
+		 * START and was NACKed (IBIRESP): our header was not sent. Send
+		 * it again right away: it goes out after a repeated START, where
+		 * targets do not arbitrate. Without this the CCC or message went
+		 * on over a bus that never saw its header and timed out (-116),
+		 * e.g. every RSTDAA while a bridge that kept its DA across an
+		 * N947 reset raised IBIs.
+		 */
+		base->MSTATUS = I3C_MSTATUS_IBIWON_MASK;
+		LOG_DBG("START to 0x%02x lost to a request from 0x%02x, resending", addr,
+			(uint32_t)((base->MSTATUS & I3C_MSTATUS_IBIADDR_MASK) >>
+				   I3C_MSTATUS_IBIADDR_SHIFT));
+	}
+
 	if (ret == 0) {
 		/*
 		 * Check for NACK in MERRWARN itself, then in the ISR snapshot
@@ -1297,6 +1324,15 @@ out_xfer_i3c:
  */
 static void mcux_i3c_daa_nack_requests(const struct device *dev, I3C_Type *base)
 {
+	/*
+	 * A request NACKed after it won a START (IBIWON) leaves the controller
+	 * in NORMACT until a STOP: the wait for IDLE below would time out
+	 * (seen: a Hot-Join right after RSTDAA, MSTATUS 0x02003cc3).
+	 */
+	if (mcux_i3c_state_get(base) == I3C_MSTATUS_STATE_NORMACT) {
+		mcux_i3c_request_emit_stop(dev->data, base, true);
+	}
+
 	for (int i = 0; i < MCUX_I3C_DAA_IBI_DRAIN_MAX; i++) {
 		if (mcux_i3c_state_get(base) != I3C_MSTATUS_STATE_SLVREQ) {
 			base->MSTATUS = I3C_MSTATUS_SLVSTART_MASK;
