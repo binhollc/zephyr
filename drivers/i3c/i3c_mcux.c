@@ -914,6 +914,7 @@ static int mcux_i3c_do_one_xfer_read(I3C_Type *base, struct mcux_i3c_data *data,
 {
 	int ret = 0;
 	int offset = 0;
+	bool complete = false;
 
 	while (offset < buf_sz) {
 		/*
@@ -928,6 +929,7 @@ static int mcux_i3c_do_one_xfer_read(I3C_Type *base, struct mcux_i3c_data *data,
 					LOG_DBG("Target data complete, offset %d buf_sz %d", offset,
 						buf_sz);
 					ret = offset;
+					complete = true;
 					break;
 				}
 
@@ -947,8 +949,13 @@ static int mcux_i3c_do_one_xfer_read(I3C_Type *base, struct mcux_i3c_data *data,
 			}
 		}
 
-		/* Done reading all data */
-		if (ret > 0) {
+		/*
+		 * Done reading all data. Test the flag, not ret > 0: a message
+		 * that completes with nothing read (e.g. an IBI ACKed without
+		 * its mandatory byte) left ret at 0 and spun here forever, in
+		 * the cooperative IBI workqueue, starving every other thread.
+		 */
+		if (complete) {
 			break;
 		}
 
@@ -1888,6 +1895,10 @@ static void mcux_i3c_ibi_work(struct k_work *work)
 							sizeof(payload));
 			if (ret >= 0) {
 				payload_sz = (size_t)ret;
+				if ((ret == 0) && data->ibi.has_mandatory_byte) {
+					LOG_WRN("IBI from 0x%x without its mandatory byte "
+						"(MIBIRULES 0x%08x)", ibiaddr, base->MIBIRULES);
+				}
 			} else {
 				LOG_ERR("Error reading IBI payload");
 
@@ -2292,6 +2303,16 @@ static int mcux_i3c_configure(const struct device *dev,
 	base->MINTSET = I3C_MSTATUS_ERRWARN_MASK | I3C_MSTATUS_SLVSTART_MASK;
 
 #ifdef CONFIG_I3C_USE_IBI
+	/*
+	 * I3C_MasterInit() also clears MIBIRULES while the IBI list still holds
+	 * the enabled targets. Auto-IBI then ACKs their IBIs without reading
+	 * the mandatory byte (a PendRead IBI arrives with no MDB). Put the
+	 * rules back.
+	 */
+	if (dev_data->ibi.num_addr > 0U) {
+		mcux_i3c_ibi_rules_setup(dev_data, base);
+	}
+
 	if (dev_data->ibi.sda_stuck) {
 		dev_data->ibi.sda_stuck = false;
 		LOG_WRN("Controller re-initialized: target requests serviced again");
