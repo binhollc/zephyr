@@ -65,6 +65,22 @@ LOG_MODULE_REGISTER(i3c_mcux, CONFIG_I3C_MCUX_LOG_LEVEL);
 
 #define I3C_MAX_STOP_RETRIES 5
 
+/* Longest wait for the controller to leave NORMACT after EMIT_STOP. */
+#define MCUX_I3C_STOP_WAIT_MAX_US	10000U
+
+/*
+ * Back-off before target requests are serviced again once a target holds SDA
+ * low. Servicing it at once would loop ISR -> IBI work -> ISR at workqueue
+ * priority and starve every other thread.
+ */
+#define MCUX_I3C_SDA_STUCK_BACKOFF_MS	100
+
+/* Waits of 10 ms for IDLE before a transfer gives up (500 ms). */
+#define MCUX_I3C_WAIT_IDLE_TRIES	50
+
+/* NACKed broadcast headers (IBI arbitration) retried before a transfer fails. */
+#define MCUX_I3C_BCAST_NACK_RETRIES	10
+
 #define I3C_TRANSFER_TIMEOUT_MSEC					\
 	COND_CODE_0(CONFIG_I3C_NXP_TRANSFER_TIMEOUT, (K_FOREVER),	\
 	(K_MSEC(CONFIG_I3C_NXP_TRANSFER_TIMEOUT)))
@@ -124,6 +140,15 @@ struct mcux_i3c_data {
 		 * for IBI.
 		 */
 		bool has_mandatory_byte;
+
+		/** Re-arms target requests after an SDA-held-low back-off. */
+		struct k_work_delayable rearm;
+
+		/** Controller this data belongs to (for the rearm work). */
+		const struct device *dev;
+
+		/** A target holds SDA low (IBI headers read address 0x00). */
+		bool sda_stuck;
 	} ibi;
 #endif
 
@@ -333,7 +358,9 @@ static inline void mcux_i3c_status_clear(I3C_Type *base, uint32_t mask)
 /**
  * @brief Clear transfer and IBI related bits in MSTATUS.
  *
- * This spins forever for those bits to be cleared;
+ * MSTATUS.ERRWARN only reads 0 once MERRWARN is clear, so MERRWARN is
+ * cleared first; otherwise a pending error (with the ERRWARN interrupt
+ * off, no ISR clears it) made this spin forever. Bounded to ~1 ms.
  *
  * @see I3C_MSTATUS_MCTRLDONE_MASK
  * @see I3C_MSTATUS_COMPLETE_MASK
@@ -349,7 +376,14 @@ static inline void mcux_i3c_status_clear_all(I3C_Type *base)
 			I3C_MSTATUS_IBIWON_MASK |
 			I3C_MSTATUS_ERRWARN_MASK;
 
-	mcux_i3c_status_clear(base, mask);
+	for (int i = 0; i < 1000; i++) {
+		base->MERRWARN = base->MERRWARN;
+		base->MSTATUS = mask;
+		if (!mcux_i3c_status_is_set(base, mask)) {
+			break;
+		}
+		k_busy_wait(1);
+	}
 }
 
 /**
@@ -526,10 +560,15 @@ static inline int mcux_i3c_state_wait_timeout(I3C_Type *base, uint32_t state,
  */
 static inline void mcux_i3c_wait_idle(struct mcux_i3c_data *dev_data, I3C_Type *base)
 {
-	while (mcux_i3c_state_get(base) != I3C_MSTATUS_STATE_IDLE) {
-		k_condvar_wait(&dev_data->condvar,
-				     &dev_data->lock,
-				     K_FOREVER);
+	/*
+	 * Bounded: a target holding SDA low keeps the controller in SLVREQ;
+	 * the transfer then fails to START instead of blocking forever.
+	 */
+	for (int i = 0; i < MCUX_I3C_WAIT_IDLE_TRIES; i++) {
+		if (mcux_i3c_state_get(base) == I3C_MSTATUS_STATE_IDLE) {
+			return;
+		}
+		(void)k_condvar_wait(&dev_data->condvar, &dev_data->lock, K_MSEC(10));
 	}
 }
 
@@ -614,6 +653,8 @@ static inline int mcux_i3c_do_request_emit_stop(struct mcux_i3c_data *dev_data, 
 	 */
 
 	if (wait_stop) {
+		uint32_t waited_us = 0U;
+
 		/*
 		 * Note that we don't exactly wait for I3C_MSTATUS_STATE_IDLE.
 		 * If there is an incoming IBI, it will get stuck forever
@@ -621,6 +662,11 @@ static inline int mcux_i3c_do_request_emit_stop(struct mcux_i3c_data *dev_data, 
 		 */
 		while (reg32_test_match(&base->MSTATUS, I3C_MSTATUS_STATE_MASK,
 					I3C_MSTATUS_STATE_NORMACT)) {
+			/* A target holding SDA low keeps the STOP from completing. */
+			if (waited_us >= MCUX_I3C_STOP_WAIT_MAX_US) {
+				return -ETIMEDOUT;
+			}
+			waited_us += 10U;
 			merrwarn = mcux_i3c_has_error(dev_data);
 			if (merrwarn) {
 				/*
@@ -1149,10 +1195,12 @@ static int mcux_i3c_transfer(const struct device *dev,
 		 * unless flag is set not to.
 		 */
 		if (!(msgs[i].flags & I3C_MSG_NBCH) && (send_broadcast)) {
+			int nacks = 0;
+
 			while (1) {
 				ret = mcux_i3c_request_emit_start(
 					dev_data, base, I3C_BROADCAST_ADDR, false, false, 0);
-				if (ret == -ENODEV) {
+				if ((ret == -ENODEV) && (++nacks <= MCUX_I3C_BCAST_NACK_RETRIES)) {
 					LOG_WRN("emit start of broadcast addr got NACK, maybe IBI");
 					/* wait for idle then try again */
 					mcux_i3c_wait_idle(dev_data, base);
@@ -1713,6 +1761,22 @@ out_ccc_stop:
  *
  * @param work Pointer to k_work item.
  */
+static void mcux_i3c_ibi_rearm(struct k_work *work)
+{
+	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+	struct mcux_i3c_data *data = CONTAINER_OF(dwork, struct mcux_i3c_data, ibi.rearm);
+	const struct mcux_i3c_config *config = data->ibi.dev->config;
+	I3C_Type *base = config->base;
+
+	if (data->ibi.sda_stuck && (mcux_i3c_state_get(base) == I3C_MSTATUS_STATE_IDLE)) {
+		data->ibi.sda_stuck = false;
+		LOG_WRN("SDA released: target requests serviced again");
+	}
+
+	/* Still stuck: the ISR fires again and the work backs off again. */
+	base->MINTSET = I3C_MINTSET_SLVSTART_MASK;
+}
+
 static void mcux_i3c_ibi_work(struct k_work *work)
 {
 	uint8_t payload[CONFIG_I3C_IBI_MAX_PAYLOAD_SIZE];
@@ -1751,6 +1815,37 @@ static void mcux_i3c_ibi_work(struct k_work *work)
 
 	mstatus = sys_read32((mem_addr_t)&base->MSTATUS);
 	ibiaddr = (mstatus & I3C_MSTATUS_IBIADDR_MASK) >> I3C_MSTATUS_IBIADDR_SHIFT;
+
+	/*
+	 * No target owns address 0x00: a request whose header reads 0x00 is a
+	 * target holding SDA low (every bit 0). Stop servicing requests for a
+	 * while instead of re-arming at once, which would spin ISR -> work ->
+	 * ISR and freeze every lower-priority thread.
+	 */
+	if (ibiaddr == 0U) {
+		/*
+		 * Leave the controller parked (IBIACK): NACKing makes it clock
+		 * header after header while SDA stays low. Do not wait for the
+		 * STOP, it cannot complete. Transfers fail to START meanwhile;
+		 * a reconfigure (e.g. the application's bus re-init) clears it
+		 * once the target lets SDA go.
+		 */
+		mcux_i3c_request_emit_stop(data, base, false);
+		if (!data->ibi.sda_stuck) {
+			data->ibi.sda_stuck = true;
+			LOG_ERR("SDA held low by a target (IBI header address 0x00): "
+				"target requests off, retry every %d ms",
+				MCUX_I3C_SDA_STUCK_BACKOFF_MS);
+		}
+		k_mutex_unlock(&data->lock);
+		(void)k_work_schedule(&data->ibi.rearm,
+				      K_MSEC(MCUX_I3C_SDA_STUCK_BACKOFF_MS));
+		return;
+	}
+	if (data->ibi.sda_stuck) {
+		data->ibi.sda_stuck = false;
+		LOG_WRN("SDA released: target requests serviced again");
+	}
 
 	/*
 	 * Note that the I3C_MSTATUS_IBI_TYPE_* are not shifted right.
@@ -2188,6 +2283,21 @@ static int mcux_i3c_configure(const struct device *dev,
 	/* Initialize hardware */
 	I3C_MasterInit(base, &master_config, clock_freq);
 
+	/*
+	 * I3C_MasterInit() clears MINTSET. On a runtime reconfigure (after
+	 * mcux_i3c_init()) that left the error and target-request interrupts
+	 * off: MERRWARN was then never cleared by the ISR and SLVSTART only
+	 * came back via DAA. Restore what mcux_i3c_init() enables.
+	 */
+	base->MINTSET = I3C_MSTATUS_ERRWARN_MASK | I3C_MSTATUS_SLVSTART_MASK;
+
+#ifdef CONFIG_I3C_USE_IBI
+	if (dev_data->ibi.sda_stuck) {
+		dev_data->ibi.sda_stuck = false;
+		LOG_WRN("Controller re-initialized: target requests serviced again");
+	}
+#endif
+
 out_configure:
 	return ret;
 }
@@ -2256,6 +2366,10 @@ static int mcux_i3c_init(const struct device *dev)
 	k_mutex_init(&data->lock);
 	k_condvar_init(&data->condvar);
 	k_sem_init(&data->device_sync_sem, 0, K_SEM_MAX_LIMIT);
+#ifdef CONFIG_I3C_USE_IBI
+	data->ibi.dev = dev;
+	k_work_init_delayable(&data->ibi.rearm, mcux_i3c_ibi_rearm);
+#endif
 
 	I3C_MasterGetDefaultConfig(&ctrl_config_hal);
 
