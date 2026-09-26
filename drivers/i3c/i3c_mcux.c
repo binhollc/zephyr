@@ -1826,9 +1826,33 @@ static void mcux_i3c_ibi_rearm(struct k_work *work)
 	const struct mcux_i3c_config *config = data->ibi.dev->config;
 	I3C_Type *base = config->base;
 
-	if (data->ibi.sda_stuck && (mcux_i3c_state_get(base) == I3C_MSTATUS_STATE_IDLE)) {
-		data->ibi.sda_stuck = false;
-		LOG_WRN("SDA released: target requests serviced again");
+	if (data->ibi.sda_stuck) {
+		if (k_mutex_lock(&data->lock, K_NO_WAIT) != 0) {
+			/* A transfer owns the controller: look again later. */
+			(void)k_work_schedule(&data->ibi.rearm, K_MSEC(MCUX_I3C_SDA_STUCK_BACKOFF_MS));
+			return;
+		}
+		/*
+		 * The work parked the controller in IBIACK on the 0x00 header. Only
+		 * a reconfigure left that state, so the first transfer after the
+		 * target let SDA go waited out the IDLE timeout on every retry
+		 * (1.5 s, E4). NACK the request and STOP instead: with SDA high
+		 * again the controller is IDLE at once; with SDA still low this
+		 * clocks one more header (one per back-off, not a spin) and the
+		 * work parks it again.
+		 */
+		/* Only the park itself: IBIACK on the 0x00 header of a held SDA. */
+		if ((mcux_i3c_state_get(base) == I3C_MSTATUS_STATE_IBIACK) &&
+		    ((base->MSTATUS & I3C_MSTATUS_IBIADDR_MASK) == 0U)) {
+			(void)mcux_i3c_ibi_respond_nack(base);
+			mcux_i3c_request_emit_stop(data, base, false);
+			k_busy_wait(100);
+		}
+		if (mcux_i3c_state_get(base) == I3C_MSTATUS_STATE_IDLE) {
+			data->ibi.sda_stuck = false;
+			LOG_WRN("SDA released: target requests serviced again");
+		}
+		k_mutex_unlock(&data->lock);
 	}
 
 	/* Still stuck: the ISR fires again and the work backs off again. */
