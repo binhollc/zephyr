@@ -1828,7 +1828,13 @@ static void mcux_i3c_ibi_rearm(struct k_work *work)
 
 	if (data->ibi.sda_stuck) {
 		if (k_mutex_lock(&data->lock, K_NO_WAIT) != 0) {
-			/* A transfer owns the controller: look again later. */
+			/*
+			 * A transfer owns the controller: look again later, but
+			 * service target requests meanwhile as before. Leaving
+			 * SLVSTART off here lost the response IBI that transfer
+			 * was waiting for (2 s IBI timeout, SDA-05 final stress).
+			 */
+			base->MINTSET = I3C_MINTSET_SLVSTART_MASK;
 			(void)k_work_schedule(&data->ibi.rearm, K_MSEC(MCUX_I3C_SDA_STUCK_BACKOFF_MS));
 			return;
 		}
