@@ -124,7 +124,13 @@ int i3c_ccc_do_rstact(const struct i3c_device_desc *target,
 		ccc_tgt_payload.data = data;
 		ccc_tgt_payload.data_len = sizeof(*data);
 	} else {
+		/* Direct write: the Defining Byte is all, no data to the target
+		 * (this left data / data_len uninitialized: the controller sent
+		 * stack contents after the target address).
+		 */
 		ccc_tgt_payload.rnw = 0;
+		ccc_tgt_payload.data = NULL;
+		ccc_tgt_payload.data_len = 0;
 	}
 
 	ccc_payload.ccc.id = I3C_CCC_RSTACT(false);
