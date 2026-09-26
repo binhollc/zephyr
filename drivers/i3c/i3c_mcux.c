@@ -1669,6 +1669,65 @@ out_daa_unlock:
 	return ret;
 }
 
+/*
+ * An RSTACT write (Defining Byte below 0x80) only configures a reset: the
+ * Target Reset Pattern that follows it in the same frame triggers it, and a
+ * START clears it (I3C v1.1.1 5.1.11). Without the pattern RSTACT did
+ * nothing on the bus.
+ */
+static bool mcux_i3c_ccc_is_rstact_set(const struct i3c_ccc_payload *payload)
+{
+	if ((payload->ccc.id != I3C_CCC_RSTACT(true)) &&
+	    (payload->ccc.id != I3C_CCC_RSTACT(false))) {
+		return false;
+	}
+	if ((payload->ccc.data_len < 1U) || (payload->ccc.data[0] >= 0x80U)) {
+		return false;
+	}
+	for (int idx = 0; idx < payload->targets.num_targets; idx++) {
+		if (payload->targets.payloads[idx].rnw != 0U) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * Target Reset Pattern: MCTRL.REQUEST = Force Exit and Target Reset with
+ * TYPE = 2 (TYPE = 0 is the HDR Exit Pattern), as for the same controller
+ * IP in i3c_npcx.c. The pattern ends with Sr + P: the bus is idle after it.
+ */
+static int mcux_i3c_request_target_reset(I3C_Type *base)
+{
+	base->MCTRL = I3C_MCTRL_REQUEST_FORCE_EXIT | I3C_MCTRL_TYPE(2);
+	return mcux_i3c_state_wait_timeout(base, I3C_MSTATUS_STATE_IDLE, 1, 1000);
+}
+
+#ifdef CONFIG_I3C_USE_IBI
+static void mcux_i3c_ibi_rules_setup(struct mcux_i3c_data *data, I3C_Type *base);
+
+/* Targets reset by the pattern lost their DA: drop their IBI rules. */
+static void mcux_i3c_ibi_forget_reset(struct mcux_i3c_data *data, I3C_Type *base,
+				      const struct i3c_ccc_payload *payload)
+{
+	if (payload->ccc.data[0] == I3C_CCC_RSTACT_NO_RESET) {
+		return;
+	}
+	for (int i = 0; i < ARRAY_SIZE(data->ibi.addr); i++) {
+		bool hit = i3c_ccc_is_payload_broadcast(payload);
+
+		for (int t = 0; !hit && t < payload->targets.num_targets; t++) {
+			hit = data->ibi.addr[i] == payload->targets.payloads[t].addr;
+		}
+		if (hit && (data->ibi.addr[i] != 0U)) {
+			data->ibi.addr[i] = 0U;
+			data->ibi.num_addr--;
+		}
+	}
+	mcux_i3c_ibi_rules_setup(data, base);
+}
+#endif
+
 /**
  * @brief Send Common Command Code (CCC).
  *
@@ -1685,6 +1744,7 @@ static int mcux_i3c_do_ccc(const struct device *dev,
 	const struct mcux_i3c_config *config = dev->config;
 	struct mcux_i3c_data *data = dev->data;
 	I3C_Type *base = config->base;
+	bool rstact;
 	int ret = 0;
 
 	if (payload == NULL) {
@@ -1706,6 +1766,36 @@ static int mcux_i3c_do_ccc(const struct device *dev,
 	(void)mcux_i3c_has_error(data);   /* stale snapshot, see mcux_i3c_transfer() */
 
 	LOG_DBG("CCC[0x%02x]", payload->ccc.id);
+
+	rstact = mcux_i3c_ccc_is_rstact_set(payload);
+	if (rstact && !i3c_ccc_is_payload_broadcast(payload)) {
+		/*
+		 * The pattern resets every Target without an RSTACT in this
+		 * frame (default: I3C Peripheral reset). A Broadcast RSTACT
+		 * "No Reset" first keeps the others out; the Direct RSTACT
+		 * then sets the action of the addressed Targets only.
+		 */
+		uint8_t no_reset[2] = { I3C_CCC_RSTACT(true), I3C_CCC_RSTACT_NO_RESET };
+
+		ret = mcux_i3c_request_emit_start(data, base, I3C_BROADCAST_ADDR,
+						  false, false, 0);
+		if (ret == 0) {
+			mcux_i3c_status_clear_all(base);
+			mcux_i3c_errwarn_clear_all_nowait(base);
+			ret = mcux_i3c_do_one_xfer_write(base, data, no_reset,
+							 sizeof(no_reset), false);
+		}
+		if (ret >= 0) {
+			ret = mcux_i3c_status_wait_clear_timeout(base,
+								 I3C_MSTATUS_COMPLETE_MASK,
+								 1000);
+		}
+		if (ret < 0) {
+			LOG_ERR("CCC[0x%02x] broadcast RSTACT (no reset) error (%d)",
+				payload->ccc.id, ret);
+			goto out_ccc_stop;
+		}
+	}
 
 	/* Emit START */
 	ret = mcux_i3c_request_emit_start(data, base, I3C_BROADCAST_ADDR, false, false, 0);
@@ -1800,6 +1890,21 @@ static int mcux_i3c_do_ccc(const struct device *dev,
 		LOG_DBG("RSTDAA: IBI table cleared");
 	}
 #endif
+
+	if ((ret >= 0) && rstact) {
+		int rst = mcux_i3c_request_target_reset(base);
+
+		if (rst != 0) {
+			LOG_ERR("CCC[0x%02x] Target Reset Pattern error (%d)",
+				payload->ccc.id, rst);
+			ret = rst;
+		}
+#ifdef CONFIG_I3C_USE_IBI
+		else {
+			mcux_i3c_ibi_forget_reset(data, base, payload);
+		}
+#endif
+	}
 
 out_ccc_stop:
 	mcux_i3c_request_emit_stop(data, base, true);
