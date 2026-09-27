@@ -1859,6 +1859,26 @@ static int mcux_i3c_do_ccc(const struct device *dev,
 			bool is_read = tgt_payload->rnw == 1U;
 			bool emit_start = idx == 0;
 
+			if (rstact && !is_read && (tgt_payload->data_len == 0U)) {
+				/*
+				 * RSTACT write: the address alone, no STOP (an empty
+				 * transfer ends the frame). A STOP frees the bus before
+				 * the Target Reset Pattern, and a target request (IBI
+				 * START) in that gap clears the reset action this frame
+				 * gave every target: a bystander then resets on the bare
+				 * pattern (PIC, 1 run in 5 after other traffic).
+				 */
+				ret = mcux_i3c_request_emit_start(data, base, tgt_payload->addr,
+								  false, false, 0);
+				if (ret < 0) {
+					LOG_ERR("CCC[0x%02x] target 0x%02x not acknowledged (%d)",
+						payload->ccc.id, tgt_payload->addr, ret);
+					goto out_ccc_stop;
+				}
+				tgt_payload->num_xfer = 0;
+				continue;
+			}
+
 			ret = mcux_i3c_do_one_xfer(base, data,
 						   tgt_payload->addr, false,
 						   tgt_payload->data,
