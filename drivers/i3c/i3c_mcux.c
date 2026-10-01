@@ -939,6 +939,8 @@ static int mcux_i3c_recover_bus(const struct device *dev)
 static int mcux_i3c_do_one_xfer_read(I3C_Type *base, struct mcux_i3c_data *data,
 				     uint8_t *buf, size_t buf_sz)
 {
+	const int64_t deadline = (CONFIG_I3C_NXP_TRANSFER_TIMEOUT == 0) ? INT64_MAX :
+				 k_uptime_get() + CONFIG_I3C_NXP_TRANSFER_TIMEOUT;
 	int ret = 0;
 	int offset = 0;
 	bool complete = false;
@@ -963,8 +965,15 @@ static int mcux_i3c_do_one_xfer_read(I3C_Type *base, struct mcux_i3c_data *data,
 				/* More data to come, enable Receive pending interrupt */
 				base->MINTSET = I3C_MSTATUS_RXPEND_MASK;
 
-				/* Wait for data to arrive or an error */
-				if (k_sem_take(&data->device_sync_sem, I3C_TRANSFER_TIMEOUT_MSEC)) {
+				/*
+				 * Wait for data to arrive or an error, in short slices: a
+				 * missed RXPEND wake-up left the FIFO full and the bus held
+				 * for the whole transfer timeout, and the target then lost
+				 * its place in the response. The FIFO is looked at again
+				 * after each slice.
+				 */
+				(void)k_sem_take(&data->device_sync_sem, K_MSEC(1));
+				if (k_uptime_get() >= deadline) {
 					ret = -ETIMEDOUT;
 				}
 				/* We break out of the loop to see if the interrupt
