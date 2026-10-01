@@ -954,6 +954,18 @@ static int mcux_i3c_do_one_xfer_read(I3C_Type *base, struct mcux_i3c_data *data,
 			if (mcux_i3c_fifo_rx_count_get(base) == 0) {
 				/* No more data - check if target marked message as complete */
 				if (mcux_i3c_status_is_set(base, I3C_MSTATUS_COMPLETE_MASK)) {
+					/*
+					 * The last byte can land in the FIFO between the
+					 * count read above and this flag (an interrupt in
+					 * between is enough) and COMPLETE is set after it:
+					 * drain the FIFO once more, or that byte is lost
+					 * (the next transfer flushes it) and the read
+					 * comes back one byte short.
+					 */
+					while ((offset < buf_sz) &&
+					       (mcux_i3c_fifo_rx_count_get(base) != 0)) {
+						buf[offset++] = (uint8_t)base->MRDATAB;
+					}
 					/* All data received, move on */
 					LOG_DBG("Target data complete, offset %d buf_sz %d", offset,
 						buf_sz);
