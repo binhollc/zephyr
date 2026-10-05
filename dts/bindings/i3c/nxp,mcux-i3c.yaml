@@ -45,3 +45,19 @@ properties:
       If true, open drain high time is same as ODBAUD
       so that open drain clock is 50% duty cycle.
       Default is false.
+
+  high-keeper:
+    type: string
+    default: "none"
+    enum:
+      - "none"
+      - "wired-in"
+      - "passive-sda"
+      - "passive-sda-scl"
+    description: |
+      MCONFIG.HKEEP: how SDA (and SCL) are held high when no device drives
+      them, e.g. in the hand-off after a target's end-of-data T-bit.
+      "none" (the reset value) keeps the previous behaviour. Some targets
+      release SDA right after SCL rises on that T-bit; if the controller
+      drives SDA low only later, the bus shows a STOP then a START there.
+      A high keeper closes that gap.
