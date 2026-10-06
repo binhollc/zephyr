@@ -29,6 +29,9 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(i3c_mcux, CONFIG_I3C_MCUX_LOG_LEVEL);
 
+/* How long a read waits after COMPLETE for a last byte RXCOUNT has not counted yet */
+#define MCUX_I3C_LATE_RX_US 10
+
 #define I3C_MCTRL_REQUEST_NONE			I3C_MCTRL_REQUEST(0)
 #define I3C_MCTRL_REQUEST_EMIT_START_ADDR	I3C_MCTRL_REQUEST(1)
 #define I3C_MCTRL_REQUEST_EMIT_STOP		I3C_MCTRL_REQUEST(2)
@@ -968,6 +971,25 @@ static int mcux_i3c_do_one_xfer_read(I3C_Type *base, struct mcux_i3c_data *data,
 					while ((offset < buf_sz) &&
 					       (mcux_i3c_fifo_rx_count_get(base) != 0)) {
 						buf[offset++] = (uint8_t)base->MRDATAB;
+					}
+					/*
+					 * COMPLETE can also become visible a few cycles
+					 * before RXCOUNT counts the last byte (seen on the
+					 * MCXA287, about one read in several thousand):
+					 * give the FIFO a short, bounded window to catch up.
+					 */
+					for (int us = 0; (us < MCUX_I3C_LATE_RX_US) && (offset < buf_sz);
+					     us++) {
+						if (mcux_i3c_fifo_rx_count_get(base) != 0) {
+							while ((offset < buf_sz) &&
+							       (mcux_i3c_fifo_rx_count_get(base) != 0)) {
+								buf[offset++] = (uint8_t)base->MRDATAB;
+							}
+							LOG_WRN("RX byte landed %d us after COMPLETE "
+								"(offset %d)", us, offset);
+							break;
+						}
+						k_busy_wait(1);
 					}
 					/* All data received, move on */
 					LOG_DBG("Target data complete, offset %d buf_sz %d", offset,
