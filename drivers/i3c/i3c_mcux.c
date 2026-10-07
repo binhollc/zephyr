@@ -19,6 +19,7 @@
 #include <zephyr/drivers/i3c.h>
 #include <zephyr/spinlock.h>
 #include <zephyr/drivers/pinctrl.h>
+#include <zephyr/pm/device.h>
 
 /*
  * This is from NXP HAL which contains register bits macros
@@ -168,6 +169,11 @@ struct mcux_i3c_data {
 
 	/** Lock to serialize errnwarn access */
 	struct k_spinlock errwarn_lock;
+
+#ifdef CONFIG_PM_DEVICE
+	/** MCONFIG kept across a suspend (the controller is off while suspended) */
+	uint32_t mconfig_suspended;
+#endif
 };
 
 /**
@@ -2818,6 +2824,52 @@ out_xfer_i2c_stop_unlock:
 	return ret;
 }
 
+#ifdef CONFIG_PM_DEVICE
+/**
+ * @brief Suspend / resume the controller so another controller can own the bus.
+ *
+ * Suspend turns the controller off (MCONFIG.MSTENA = 0) and moves SDA, SCL and
+ * the pull-up pad to the "sleep" pinctrl state (GPIO inputs, no pull), so this
+ * controller neither drives nor pulls up the bus. Without a sleep state only
+ * the controller is turned off. Resume restores the default pinctrl and
+ * MCONFIG; the caller re-runs the bus initialization (DAA) afterwards.
+ */
+static int mcux_i3c_pm_action(const struct device *dev, enum pm_device_action action)
+{
+	const struct mcux_i3c_config *config = dev->config;
+	struct mcux_i3c_data *data = dev->data;
+	I3C_Type *base = config->base;
+	int ret = 0;
+
+	k_mutex_lock(&data->lock, K_FOREVER);
+
+	switch (action) {
+	case PM_DEVICE_ACTION_SUSPEND:
+		data->mconfig_suspended = base->MCONFIG;
+		base->MCONFIG &= ~I3C_MCONFIG_MSTENA_MASK;
+		ret = pinctrl_apply_state(config->pincfg, PINCTRL_STATE_SLEEP);
+		if (ret == -ENOENT) {
+			ret = 0;
+		}
+		break;
+	case PM_DEVICE_ACTION_RESUME:
+		ret = pinctrl_apply_state(config->pincfg, PINCTRL_STATE_DEFAULT);
+		if (ret == 0) {
+			mcux_i3c_xfer_reset(base);
+			base->MCONFIG = data->mconfig_suspended;
+		}
+		break;
+	default:
+		ret = -ENOTSUP;
+		break;
+	}
+
+	k_mutex_unlock(&data->lock);
+
+	return ret;
+}
+#endif /* CONFIG_PM_DEVICE */
+
 static DEVICE_API(i3c, mcux_i3c_driver_api) = {
 	.i2c_api.configure = mcux_i3c_i2c_api_configure,
 	.i2c_api.transfer = mcux_i3c_i2c_api_transfer,
@@ -2876,9 +2928,10 @@ static DEVICE_API(i3c, mcux_i3c_driver_api) = {
 		.common.ctrl_config.scl.i3c = DT_INST_PROP_OR(id, i3c_scl_hz, 0),	\
 		.common.ctrl_config.scl.i2c = DT_INST_PROP_OR(id, i2c_scl_hz, 0),	\
 	};									\
+	PM_DEVICE_DT_INST_DEFINE(id, mcux_i3c_pm_action);			\
 	DEVICE_DT_INST_DEFINE(id,						\
 			      mcux_i3c_init,					\
-			      NULL,						\
+			      PM_DEVICE_DT_INST_GET(id),			\
 			      &mcux_i3c_data_##id,				\
 			      &mcux_i3c_config_##id,				\
 			      POST_KERNEL,					\
