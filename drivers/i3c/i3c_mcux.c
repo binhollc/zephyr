@@ -29,6 +29,11 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(i3c_mcux, CONFIG_I3C_MCUX_LOG_LEVEL);
 
+/* How long a read polls for its next byte before it sleeps on RXPEND */
+#define MCUX_I3C_RX_SPIN_US 50
+/* RX FIFO fill level that is logged: the read nearly made the controller hold SCL */
+#define MCUX_I3C_RX_DEEP 6
+
 #define I3C_MCTRL_REQUEST_NONE			I3C_MCTRL_REQUEST(0)
 #define I3C_MCTRL_REQUEST_EMIT_START_ADDR	I3C_MCTRL_REQUEST(1)
 #define I3C_MCTRL_REQUEST_EMIT_STOP		I3C_MCTRL_REQUEST(2)
@@ -927,6 +932,32 @@ static int mcux_i3c_recover_bus(const struct device *dev)
 }
 
 /**
+ * @brief Wait a short while for the next RX byte without sleeping.
+ *
+ * @param base Pointer to controller registers.
+ *
+ * @return true if a byte or COMPLETE showed up, false if the wait ran out
+ *         or an error is pending (the caller's sleep path handles it).
+ */
+static bool mcux_i3c_rx_spin(I3C_Type *base)
+{
+	const uint32_t start = k_cycle_get_32();
+	const uint32_t budget = k_us_to_cyc_ceil32(MCUX_I3C_RX_SPIN_US);
+
+	while ((k_cycle_get_32() - start) < budget) {
+		if (base->MERRWARN != 0U) {
+			return false;
+		}
+		if ((mcux_i3c_fifo_rx_count_get(base) != 0) ||
+		    mcux_i3c_status_is_set(base, I3C_MSTATUS_COMPLETE_MASK)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+/**
  * @brief Perform one read transaction.
  *
  * This reads from RX FIFO until COMPLETE bit is set in MSTATUS
@@ -946,6 +977,7 @@ static int mcux_i3c_do_one_xfer_read(I3C_Type *base, struct mcux_i3c_data *data,
 				 k_uptime_get() + CONFIG_I3C_NXP_TRANSFER_TIMEOUT;
 	int ret = 0;
 	int offset = 0;
+	int rx_max = 0;
 	bool complete = false;
 
 	while (offset < buf_sz) {
@@ -954,7 +986,9 @@ static int mcux_i3c_do_one_xfer_read(I3C_Type *base, struct mcux_i3c_data *data,
 		 * in a loop until data is unavailable in the FIFO.
 		 */
 		while (offset < buf_sz) {
-			if (mcux_i3c_fifo_rx_count_get(base) == 0) {
+			int rx_count = mcux_i3c_fifo_rx_count_get(base);
+
+			if (rx_count == 0) {
 				/* No more data - check if target marked message as complete */
 				if (mcux_i3c_status_is_set(base, I3C_MSTATUS_COMPLETE_MASK)) {
 					/*
@@ -977,6 +1011,18 @@ static int mcux_i3c_do_one_xfer_read(I3C_Type *base, struct mcux_i3c_data *data,
 					break;
 				}
 
+				/*
+				 * A byte lands about every 2 us at 4 MHz: wait for it
+				 * here rather than sleep, or the wake-up latency lets
+				 * the FIFO fill and the controller holds SCL in the
+				 * middle of the read (on one MCUX I3C part a byte is lost
+				 * there, about one read in several thousand). Sleep
+				 * only when the target is slow.
+				 */
+				if (mcux_i3c_rx_spin(base)) {
+					continue;
+				}
+
 				/* More data to come, enable Receive pending interrupt */
 				base->MINTSET = I3C_MSTATUS_RXPEND_MASK;
 
@@ -996,6 +1042,7 @@ static int mcux_i3c_do_one_xfer_read(I3C_Type *base, struct mcux_i3c_data *data,
 				 */
 				break;
 			} else {
+				rx_max = MAX(rx_max, rx_count);
 				buf[offset++] = (uint8_t)base->MRDATAB;
 			}
 		}
@@ -1019,6 +1066,11 @@ static int mcux_i3c_do_one_xfer_read(I3C_Type *base, struct mcux_i3c_data *data,
 			LOG_ERR("Timeout error");
 			break;
 		}
+	}
+
+	/* A FIFO that nearly filled is where the controller can hold SCL mid-read */
+	if (rx_max >= MCUX_I3C_RX_DEEP) {
+		LOG_WRN("RX FIFO reached %d bytes (read of %d)", rx_max, offset);
 	}
 
 	/* If no errors, then return the number of bytes read */
